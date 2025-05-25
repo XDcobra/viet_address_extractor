@@ -5,14 +5,49 @@ import logging
 from rapidfuzz import fuzz, process
 
 # Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,  # Changed from ERROR to DEBUG to see all messages
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('address_parser.log', mode='w', encoding='utf-8')
-    ]
-)
+def setup_logging(disable_file_logging=False):
+    """
+    Configure logging for the address parser.
+    
+    Args:
+        disable_file_logging: If True, disable ALL logging (both file and console).
+    """
+    # Get the logger
+    logger = logging.getLogger('address_parser')
+    
+    # Remove any existing handlers
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    if disable_file_logging:
+        # If disable_file_logging is True, disable ALL logging
+        logger.setLevel(logging.CRITICAL)  # Set to highest level to disable all logging
+        return
+    
+    # Set the base level to DEBUG to capture all levels
+    logger.setLevel(logging.DEBUG)
+    
+    # Add console handler with INFO level
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(console_handler)
+    
+    # Add file handler with DEBUG level if not disabled
+    if not disable_file_logging:
+        # Clear the log file before starting
+        with open('address_parser.log', 'w', encoding='utf-8') as f:
+            f.write('')  # Clear the file
+            
+        file_handler = logging.FileHandler('address_parser.log', mode='a', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.addHandler(file_handler)
+    
+    # Don't propagate to root logger
+    logger.propagate = False
 
+# Initialize logger
 logger = logging.getLogger('address_parser')
 
 ##############################################################
@@ -1064,992 +1099,910 @@ def is_ambiguous_name(name, district_trie, ward_trie):
         logger.error(f"Error in is_ambiguous_name: {str(e)}")
         return False
 
-def get_match_confidence(name, tokens, district_trie=None, ward_trie=None):
+def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=None, fuzzy_score=None, scoring_weights=None, component_type=None):
     """
-    Get the confidence score and ambiguity status for a potential match.
+    Enhanced version of get_match_confidence that returns detailed information about the score calculation.
+    Now uses a 2.0 scale and incorporates fuzzy score with adjusted weights.
     
     Args:
         name: The normalized name to check
         tokens: All tokens from the address
         district_trie: Trie containing district data
         ward_trie: Trie containing ward data
-    Returns:
-        tuple: (is_ambiguous, confidence_score)
-            - is_ambiguous: True if name appears in both district and ward lists
-            - confidence_score: Float between 0 and 1 indicating match confidence
+        fuzzy_score: Optional fuzzy match score (0-100)
+        scoring_weights: Optional dictionary of scoring weights
+        component_type: Type of component being searched for ('ward' or 'district')
     """
     try:
-        logger.debug(f"\nCalculating confidence for: {name}")
-        logger.debug(f"Tokens: {tokens}")
+        # Set default weights if not provided
+        if scoring_weights is None:
+            scoring_weights = {
+                'fuzzy_score': 0.3,        # Reduced from 0.4 to give less weight to fuzzy matches
+                'exact_match': 0.6,        # Increased from 0.5 to prioritize exact matches
+                'position_bonus': {
+                    'beginning': 0.3,      # Reduced from 0.4 to be less strict about position
+                    'middle': 0.4          # Reduced from 0.5 to be less strict about position
+                },
+                'length_bonus': 0.4,       # Increased from 0.2 to favor multi-word matches
+                'non_ambiguous_bonus': 0.2, # Reduced from 0.3 to be less strict about ambiguity
+                'comma_bonus': 0.3,        # Increased from 0.2 to better handle comma-separated addresses
+                'indicator_bonus': 0.4     # Increased from 0.3 to better handle indicators
+            }
+            
+        score_details = {
+            'total_score': 0.0,
+            'components': [],
+            'is_ambiguous': False
+        }
         
-        # Check if name is ambiguous
-        is_ambiguous = False
+        # Check for ambiguity
         if district_trie and ward_trie:
             in_district = district_trie.search_exact(name)
             in_ward = ward_trie.search_exact(name)
-            is_ambiguous = in_district and in_ward
-            logger.debug(f"Found in district list: {in_district}")
-            logger.debug(f"Found in ward list: {in_ward}")
-            logger.debug(f"Is ambiguous: {is_ambiguous}")
+            score_details['is_ambiguous'] = in_district and in_ward
+            score_details['components'].append({
+                'type': 'ambiguity_check',
+                'in_district': in_district,
+                'in_ward': in_ward,
+                'is_ambiguous': score_details['is_ambiguous']
+            })
         
-        # Calculate confidence score based on multiple factors
-        confidence = 0.0
-        logger.debug("Calculating confidence factors:")
-        
-        # 1. Exact match gets highest confidence
         name_parts = name.split()
+        
+        # 1. Fuzzy Score
+        if fuzzy_score is not None:
+            fuzzy_component = (fuzzy_score / 100) * scoring_weights['fuzzy_score']
+            score_details['total_score'] += fuzzy_component
+            score_details['components'].append({
+                'type': 'fuzzy_score',
+                'score': fuzzy_component,
+                'raw_score': fuzzy_score,
+                'reason': f'Fuzzy match score of {fuzzy_score}% converted to {fuzzy_component:.2f}'
+            })
+        
+        # 2. Exact Match
+        exact_match_found = False
         for i in range(len(tokens) - len(name_parts) + 1):
             if tokens[i:i+len(name_parts)] == name_parts:
-                confidence += 0.4
-                logger.debug(f"+0.4 for exact match at position {i}")
+                score_details['total_score'] += scoring_weights['exact_match']
+                score_details['components'].append({
+                    'type': 'exact_match',
+                    'score': scoring_weights['exact_match'],
+                    'position': i,
+                    'reason': 'Exakte Übereinstimmung gefunden'
+                })
+                exact_match_found = True
                 break
-        else:
-            logger.debug("No exact match found")
         
-        # 2. Position bonus (adjusted for wards)
+        if not exact_match_found:
+            score_details['components'].append({
+                'type': 'exact_match',
+                'score': 0.0,
+                'reason': 'Keine exakte Übereinstimmung gefunden'
+            })
+        
+        # 3. Position Bonus
         position_found = False
         for i in range(len(tokens) - len(name_parts) + 1):
             if tokens[i:i+len(name_parts)] == name_parts:
                 position_found = True
-                # Reduced position bonuses for wards
-                if i == 0:  # Beginning
-                    confidence += 0.2  # Reduced from 0.4
-                    logger.debug(f"+0.2 for appearing at beginning")
-                elif i > 0 and i < len(tokens) - len(name_parts):  # Middle
-                    confidence += 0.3  # Kept same
-                    logger.debug(f"+0.3 for appearing in middle")
+                if i == 0:
+                    score_details['total_score'] += scoring_weights['position_bonus']['beginning']
+                    score_details['components'].append({
+                        'type': 'position_bonus',
+                        'score': scoring_weights['position_bonus']['beginning'],
+                        'position': 'beginning',
+                        'reason': 'Match am Anfang der Adresse'
+                    })
+                elif i > 0 and i < len(tokens) - len(name_parts):
+                    score_details['total_score'] += scoring_weights['position_bonus']['middle']
+                    score_details['components'].append({
+                        'type': 'position_bonus',
+                        'score': scoring_weights['position_bonus']['middle'],
+                        'position': 'middle',
+                        'reason': 'Match in der Mitte der Adresse'
+                    })
                 break
         
         if not position_found:
-            logger.debug("No position match found")
+            score_details['components'].append({
+                'type': 'position_bonus',
+                'score': 0.0,
+                'reason': 'Keine Position gefunden'
+            })
         
-        # 3. Length bonus (increased for multi-word names)
+        # 4. Length Bonus
         if len(name_parts) > 1:
-            confidence += 0.2
-            logger.debug(f"+0.2 for multi-word name")
+            score_details['total_score'] += scoring_weights['length_bonus']
+            score_details['components'].append({
+                'type': 'length_bonus',
+                'score': scoring_weights['length_bonus'],
+                'reason': f'Mehrteiliger Name ({len(name_parts)} Teile)'
+            })
+        else:
+            score_details['components'].append({
+                'type': 'length_bonus',
+                'score': 0.0,
+                'reason': 'Einteiliger Name'
+            })
         
-        # 4. Non-ambiguous bonus
-        if not is_ambiguous:
-            confidence += 0.3
-            logger.debug(f"+0.3 for non-ambiguous name")
+        # 5. Non-ambiguity Bonus
+        if not score_details['is_ambiguous']:
+            score_details['total_score'] += scoring_weights['non_ambiguous_bonus']
+            score_details['components'].append({
+                'type': 'non_ambiguous_bonus',
+                'score': scoring_weights['non_ambiguous_bonus'],
+                'reason': 'Name ist nicht mehrdeutig'
+            })
+        else:
+            score_details['components'].append({
+                'type': 'non_ambiguous_bonus',
+                'score': 0.0,
+                'reason': 'Name ist mehrdeutig'
+            })
         
-        # 5. Comma-aware bonus
-        # Check if this match appears after a comma
+        # 6. Comma Bonus
+        comma_bonus_found = False
         for i in range(len(tokens) - len(name_parts) + 1):
             if tokens[i:i+len(name_parts)] == name_parts:
-                # Look for comma before this position
                 for j in range(i-1, -1, -1):
                     if tokens[j] == ',':
-                        confidence += 0.2
-                        logger.debug(f"+0.2 for appearing after comma")
+                        score_details['total_score'] += scoring_weights['comma_bonus']
+                        score_details['components'].append({
+                            'type': 'comma_bonus',
+                            'score': scoring_weights['comma_bonus'],
+                            'reason': 'Match nach Komma gefunden'
+                        })
+                        comma_bonus_found = True
                         break
                 break
         
-        final_confidence = min(confidence, 1.0)
-        logger.debug(f"Final confidence score: {final_confidence}")
+        if not comma_bonus_found:
+            score_details['components'].append({
+                'type': 'comma_bonus',
+                'score': 0.0,
+                'reason': 'Kein Komma vor Match gefunden'
+            })
+            
+        # 7. Indicator Bonus (New) - Only apply for the specific component type being searched
+        indicator_bonus_found = False
+        ward_indicators = ['phuong', 'xa', 'thi tran', 'p', 'tt']
+        district_indicators = ['quan', 'huyen', 'q', 'h']
         
-        return is_ambiguous, final_confidence
+        # Define distance-based scaling factors
+        distance_scaling = {
+            1: 1.0,    # Full bonus for immediate predecessor
+            2: 0.5,    # Half bonus for 2 positions away
+            3: 0.25    # Quarter bonus for 3 positions away
+        }
+        
+        # Only check for ward indicators if we're looking for a ward
+        if component_type == 'ward':
+            for i in range(len(tokens) - len(name_parts) + 1):
+                if tokens[i:i+len(name_parts)] == name_parts:
+                    # Look for ward indicators before this position (max 3 positions)
+                    for j in range(i-1, max(-1, i-4), -1):
+                        if tokens[j] in ward_indicators:
+                            distance = i - j
+                            if distance in distance_scaling:
+                                scaled_bonus = scoring_weights['indicator_bonus'] * distance_scaling[distance]
+                                score_details['total_score'] += scaled_bonus
+                                score_details['components'].append({
+                                    'type': 'indicator_bonus',
+                                    'score': scaled_bonus,
+                                    'reason': f'Ward indicator "{tokens[j]}" found {distance} positions before match (scaled to {distance_scaling[distance]*100:.0f}%)'
+                                })
+                                indicator_bonus_found = True
+                                break
+                    break
+        
+        # Only check for district indicators if we're looking for a district
+        if component_type == 'district':
+            for i in range(len(tokens) - len(name_parts) + 1):
+                if tokens[i:i+len(name_parts)] == name_parts:
+                    # Look for district indicators before this position (max 3 positions)
+                    for j in range(i-1, max(-1, i-4), -1):
+                        if tokens[j] in district_indicators:
+                            distance = i - j
+                            if distance in distance_scaling:
+                                scaled_bonus = scoring_weights['indicator_bonus'] * distance_scaling[distance]
+                                score_details['total_score'] += scaled_bonus
+                                score_details['components'].append({
+                                    'type': 'indicator_bonus',
+                                    'score': scaled_bonus,
+                                    'reason': f'District indicator "{tokens[j]}" found {distance} positions before match (scaled to {distance_scaling[distance]*100:.0f}%)'
+                                })
+                                indicator_bonus_found = True
+                                break
+                    break
+        
+        if not indicator_bonus_found:
+            score_details['components'].append({
+                'type': 'indicator_bonus',
+                'score': 0.0,
+                'reason': 'No ward/district indicator found within 3 positions before match'
+            })
+        
+        # Final score (max 2.0)
+        score_details['total_score'] = min(score_details['total_score'], 2.0)
+        
+        return score_details
+        
     except Exception as e:
-        logger.error(f"Error in get_match_confidence: {str(e)}")
-        return False, 0.0
+        logger.error(f"Error in get_detailed_confidence_score: {str(e)}")
+        return {
+            'total_score': 0.0,
+            'components': [],
+            'is_ambiguous': False,
+            'error': str(e)
+        }
 
-def validate_district_match(matched_text, tokens, province=None, ward_trie=None, district_trie=None):
+def log_fuzzy_matches(text_to_search, candidates, component_type, tokens, district_trie=None, ward_trie=None):
     """
-    Validate a potential district match using improved ambiguity handling.
+    Logs the top 3 fuzzy matches with detailed confidence scores.
+    Only logs when a test case has failed.
     """
     try:
-        district_parts = matched_text.split()
-        district_pos = -1
-        for i in range(len(tokens) - len(district_parts) + 1):
-            if tokens[i:i+len(district_parts)] == district_parts:
-                district_pos = i
-                break
-        
-        logger.debug(f"Validating district match: {matched_text} at position {district_pos}")
-        
-        # Get match confidence and ambiguity status
-        is_ambiguous, confidence = get_match_confidence(matched_text, tokens, district_trie, ward_trie)
-        logger.debug(f"Match confidence: {confidence}, Is ambiguous: {is_ambiguous}")
-        
-        # Check for province position
-        if province:
-            province_parts = remove_diacritics(province.lower()).split()
-            province_pos = -1
-            for i in range(len(tokens) - len(province_parts) + 1):
-                if tokens[i:i+len(province_parts)] == province_parts:
-                    province_pos = i
-                    break
+        # Only log if we're in a failed test case (logging level is DEBUG)
+        if logger.level != logging.DEBUG:
+            return
             
-            if district_pos > province_pos and province_pos != -1:
-                logger.debug(f"Rejecting: district at {district_pos} appears after province at {province_pos}")
-                return False
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Fuzzy-Match Analyse für: {text_to_search}")
+        logger.info(f"Komponente: {component_type}")
+        logger.info(f"{'='*80}")
         
-        # Special handling for HCM
+        # Get top 3 matches with rapidfuzz
+        results = process.extract(
+            text_to_search,
+            candidates,
+            scorer=fuzz.ratio,
+            limit=3
+        )
+        
+        if not results:
+            logger.info("Keine Fuzzy-Matches gefunden")
+            return
+        
+        # Analyze each match
+        for i, (matched_text, score, _) in enumerate(results, 1):
+            logger.info(f"\nMatch #{i}:")
+            logger.info(f"Gefundener Text: {matched_text}")
+            logger.info(f"Fuzzy-Score: {score}%")
+            
+            # Calculate detailed confidence score with fuzzy score
+            score_details = get_detailed_confidence_score(
+                matched_text, 
+                tokens,
+                district_trie if component_type == 'district' else None,
+                ward_trie if component_type == 'ward' else None,
+                fuzzy_score=score  # Pass the fuzzy score
+            )
+            
+            logger.info(f"Confidence-Score: {score_details['total_score']:.2f}")
+            logger.info("Score-Komponenten:")
+            
+            for component in score_details['components']:
+                if component['type'] == 'fuzzy_score':
+                    logger.info(f"  - {component['type']}: {component['score']:.2f} (Raw score: {component['raw_score']}%)")
+                else:
+                    logger.info(f"  - {component['type']}: {component['score']:.2f} ({component['reason']})")
+            
+            logger.info(f"Mehrdeutig: {'Ja' if score_details['is_ambiguous'] else 'Nein'}")
+            logger.info("-" * 40)
+            
+    except Exception as e:
+        logger.error(f"Error in log_fuzzy_matches: {str(e)}")
+
+def validate_district_match(matched_text, tokens, score, validation_thresholds, province=None, ward_trie=None, district_trie=None):
+    """
+    Validate a potential district match focusing on special cases and business rules.
+    Uses the score passed from find_district.
+    """
+    try:
+        # Special case: HCM districts
         if province and province.lower() == 'ho chi minh':
-            if not matched_text.isdigit() and not any(d in matched_text for d in ['binh thanh', 'phu nhuan', 'tan binh', 'thu duc', 'go vap', 'hoc mon', 'binh chanh', 'can gio', 'nha be']):
+            if not matched_text.isdigit() and not any(d in matched_text for d in [
+                'binh thanh', 'phu nhuan', 'tan binh', 'thu duc', 'go vap', 
+                'hoc mon', 'binh chanh', 'can gio', 'nha be'
+            ]):
                 logger.debug(f"Rejecting: '{matched_text}' is not a valid HCM district")
                 return False
         
-        # If not ambiguous and has good confidence, accept
-        if not is_ambiguous and confidence >= 0.5:  # Lowered from 0.6
-            logger.debug(f"Accepting non-ambiguous district match with good confidence: {matched_text}")
-            return True
+        # Special case: Check for province position
+        if province:
+            province_parts = remove_diacritics(province.lower()).split()
+            for i in range(len(tokens) - len(province_parts) + 1):
+                if tokens[i:i+len(province_parts)] == province_parts:
+                    province_pos = i
+                    district_pos = tokens.index(matched_text.split()[0])
+                    if district_pos > province_pos:
+                        logger.debug(f"Rejecting: district at {district_pos} appears after province at {province_pos}")
+                        return False
+                    break
         
-        # If ambiguous, check position and confidence
-        if is_ambiguous:
-            # Prefer middle position for districts
-            if district_pos > 0 and district_pos < len(tokens) - len(district_parts):
-                if confidence >= 0.4:  # Lowered from 0.5
-                    logger.debug(f"Accepting ambiguous district match in middle position with good confidence: {matched_text}")
-                    return True
-            
-            # If at beginning, require higher confidence
-            if district_pos == 0 and confidence >= 0.6:  # Lowered from 0.7
-                logger.debug(f"Accepting ambiguous district match at beginning with high confidence: {matched_text}")
-                return True
+        # Use the passed score and compare with threshold
+        return score >= validation_thresholds['district']['non_ambiguous']
         
-        logger.debug(f"Rejecting district match: {matched_text}")
-        return False
     except Exception as e:
         logger.error(f"Error in validate_district_match: {str(e)}")
         return False
 
-def validate_ward_match(matched_text, tokens, district_trie=None, ward_trie=None):
+def validate_ward_match(matched_text, tokens, score, validation_thresholds, district_trie=None, ward_trie=None):
     """
-    Validate a potential ward match using improved ambiguity handling.
+    Validate a potential ward match focusing on special cases and business rules.
+    Uses the score passed from find_ward.
     """
     try:
+        # Special case: Check for comma context
         ward_parts = matched_text.split()
         ward_pos = -1
         for i in range(len(tokens) - len(ward_parts) + 1):
             if tokens[i:i+len(ward_parts)] == ward_parts:
                 ward_pos = i
+                # Check for comma before ward
+                for j in range(i-1, -1, -1):
+                    if tokens[j] == ',':
+                        # If ward appears after comma, be more lenient
+                        return score >= validation_thresholds['ward']['ambiguous_middle']
                 break
         
-        logger.debug(f"Validating ward match: {matched_text} at position {ward_pos}")
+        # Use the passed score and compare with threshold
+        return score >= validation_thresholds['ward']['non_ambiguous']
         
-        # Get match confidence and ambiguity status
-        is_ambiguous, confidence = get_match_confidence(matched_text, tokens, district_trie, ward_trie)
-        logger.debug(f"Match confidence: {confidence}, Is ambiguous: {is_ambiguous}")
-        
-        # If not ambiguous and has good confidence, accept
-        if not is_ambiguous and confidence >= 0.6:  # Increased from 0.5
-            logger.debug(f"Accepting non-ambiguous ward match with good confidence: {matched_text}")
-            return True
-        
-        # If ambiguous, check position and confidence
-        if is_ambiguous:
-            # Prefer beginning position for wards
-            if ward_pos == 0:
-                if confidence >= 0.7:  # Increased from 0.4
-                    logger.debug(f"Accepting ambiguous ward match at beginning with high confidence: {matched_text}")
-                    return True
-            
-            # If in middle, require higher confidence
-            if ward_pos > 0 and confidence >= 0.6:  # Kept same
-                logger.debug(f"Accepting ambiguous ward match in middle with high confidence: {matched_text}")
-                return True
-        
-        # Special case: Check if this ward appears after a comma
-        if ward_pos > 0:
-            for i in range(ward_pos-1, -1, -1):
-                if tokens[i] == ',':
-                    # If ward appears after comma, be more lenient
-                    if confidence >= 0.5:
-                        logger.debug(f"Accepting ward match after comma with good confidence: {matched_text}")
-                        return True
-                    break
-        
-        logger.debug(f"Rejecting ward match: {matched_text}")
-        return False
     except Exception as e:
         logger.error(f"Error in validate_ward_match: {str(e)}")
         return False
 
-def find_district(tokens, district_trie, district_indicators, province=None, ward_trie=None):
+def get_hcm_numeric_district_score(token, tokens, position):
     """
-    Find district in the normalized and tokenized address.
-    Uses context from province and ward to improve matching accuracy.
+    Calculate a confidence score for a potential numeric district in HCM context.
+    Returns 0.0 if it's not a valid numeric district.
+    
+    Args:
+        token: The token to check
+        tokens: All tokens from the address
+        position: Position of the token in the tokens list
+    
+    Returns:
+        float: Confidence score (0.0 to 2.0) or 0.0 if not valid
     """
     try:
-        if not tokens:
-            logger.debug("No tokens provided for district search")
-            return (None, None, 0)
+        # Must be a standalone number
+        if not token.isdigit():
+            return 0.0
+            
+        # Must be in valid range
+        num = int(token)
+        if not (1 <= num <= 24):
+            return 0.0
+            
+        # Check if it's part of a larger string (e.g., "46/8F")
+        if position > 0 and '/' in tokens[position-1]:
+            return 0.0
+            
+        # Base score starts at 1.0
+        score = 1.0
         
-        # Define district indicators
-        admin_prefixes = set(district_indicators)
-        logger.debug(f"Searching for district in tokens: {tokens}")
-        logger.debug(f"Province context: {province}")
-        
-        # Special case: Check for HCM numeric districts
-        if is_hcm_context(tokens):
-            logger.debug("HCM context detected, checking for numeric districts")
-            # First check for explicit district indicators
-            for i, token in enumerate(tokens):
-                # Check for "quan X" pattern
-                if token == 'quan' and i + 1 < len(tokens):
-                    next_token = tokens[i + 1]
-                    if next_token.isdigit() and len(next_token) == 1:
-                        logger.debug(f"Found HCM numeric district pattern 'quan {next_token}'")
-                        return (next_token, f"Quận {next_token}", 2)
+        # Bonus for being after "quan"
+        if position > 0 and tokens[position-1].lower() in ['q', 'quan']:
+            score += 0.8
+            
+        # Bonus for being at start of address
+        elif position == 0:
+            score += 0.6
+            
+        # Penalty for being after ward indicators
+        if position > 0 and tokens[position-1].lower() in ['p', 'phuong']:
+            score -= 0.5
+            
+        # Penalty for being in the middle of other words
+        if position > 0 and position < len(tokens) - 1:
+            if not tokens[position-1].lower() in ['q', 'quan']:
+                score -= 0.3
                 
-                # Check for "qX" pattern
-                if token.startswith('q') and len(token) == 2 and token[1].isdigit():
-                    district_num = token[1]
-                    logger.debug(f"Found HCM numeric district pattern 'q{district_num}'")
-                    return (district_num, f"Quận {district_num}", 1)
-            
-            # For HCM context, also check for named districts
-            for i, token in enumerate(tokens):
-                if token in admin_prefixes and i + 1 < len(tokens):
-                    logger.debug(f"Found district indicator: {token}")
-                    # Look for next two tokens
-                    next_tokens = []
-                    j = i + 1
-                    count = 0
-                    while j < len(tokens) and count < 2:
-                        if tokens[j] not in admin_prefixes:
-                            next_tokens.append(tokens[j])
-                            count += 1
-                        j += 1
-                    if next_tokens:
-                        # Try exact match first with the tokens
-                        text_to_search = ' '.join(next_tokens)
-                        logger.debug(f"Trying district match with indicator: {text_to_search}")
-                        if district_trie.search_exact(text_to_search):
-                            original = district_trie.get_full_word(text_to_search)
-                            logger.debug(f"Found exact district match with indicator: {text_to_search} -> {original}")
-                            if validate_district_match(text_to_search, tokens, province, ward_trie, district_trie):
-                                logger.debug(f"Validated district match with indicator: {text_to_search}")
-                                return (text_to_search, original, len(next_tokens))
-                            else:
-                                logger.debug(f"Failed to validate district match with indicator: {text_to_search}")
+        return max(0.0, min(2.0, score))
         
-        # First try to find matches with indicators
-        logger.debug("Starting indicator-based search for districts")
-        for i, token in enumerate(tokens):
-            if token in admin_prefixes and i + 1 < len(tokens):
-                logger.debug(f"Found district indicator: {token}")
-                # Look for next two tokens
-                next_tokens = []
-                j = i + 1
-                count = 0
-                while j < len(tokens) and count < 2:
-                    if tokens[j] not in admin_prefixes:
-                        next_tokens.append(tokens[j])
-                        count += 1
-                    j += 1
-                if next_tokens:
-                    # Try exact match first with the tokens
-                    text_to_search = ' '.join(next_tokens)
-                    logger.debug(f"Trying district match with indicator: {text_to_search}")
-                    if district_trie.search_exact(text_to_search):
-                        original = district_trie.get_full_word(text_to_search)
-                        logger.debug(f"Found exact district match with indicator: {text_to_search} -> {original}")
-                        if validate_district_match(text_to_search, tokens, province, ward_trie, district_trie):
-                            logger.debug(f"Validated district match with indicator: {text_to_search}")
-                            return (text_to_search, original, len(next_tokens))
-                        else:
-                            logger.debug(f"Failed to validate district match with indicator: {text_to_search}")
-                    
-                    # Try with reversed tokens if we have exactly 2
-                    if len(next_tokens) == 2:
-                        reversed_text = ' '.join(reversed(next_tokens))
-                        logger.debug(f"Trying reversed tokens: {reversed_text}")
-                        if district_trie.search_exact(reversed_text):
-                            original = district_trie.get_full_word(reversed_text)
-                            logger.debug(f"Found exact district match with reversed tokens: {reversed_text} -> {original}")
-                            if validate_district_match(reversed_text, tokens, province, ward_trie, district_trie):
-                                logger.debug(f"Validated district match with reversed tokens: {reversed_text}")
-                                return (reversed_text, original, len(next_tokens))
-                            else:
-                                logger.debug(f"Failed to validate district match with reversed tokens: {reversed_text}")
-                    
-                    # Try fuzzy match using rapidfuzz with higher threshold
-                    candidates = district_trie.collect_all_words()
-                    if candidates:
-                        logger.debug(f"Trying fuzzy match for: {text_to_search}")
-                        result = process.extractOne(
-                            text_to_search,
-                            candidates,
-                            scorer=fuzz.ratio,
-                            score_cutoff=90  # Increased threshold for stricter matching
-                        )
-                        
-                        if result:
-                            matched_text, score, _ = result
-                            logger.debug(f"Found fuzzy district match: {matched_text} (score: {score})")
-                            if validate_district_match(matched_text, tokens, province, ward_trie, district_trie):
-                                logger.debug(f"Validated fuzzy district match: {matched_text}")
-                                original = district_trie.get_full_word(matched_text)
-                                if original:
-                                    return (matched_text, original, len(next_tokens))
-                            else:
-                                logger.debug(f"Failed to validate fuzzy district match: {matched_text}")
-        
-        # Then try to find exact matches in the tokens
-        max_group = 3
-        logger.debug("Starting exact match search for districts")
-        best_match = None
-        best_match_info = None
-        for group_size in range(min(max_group, len(tokens)), 1, -1):
-            for start_idx in range(len(tokens) - group_size + 1):
-                # Skip if any token is an indicator
-                if any(t in admin_prefixes for t in tokens[start_idx:start_idx + group_size]):
-                    continue
-                group = tokens[start_idx:start_idx + group_size]
-                group_text = ' '.join(group)
-                logger.debug(f"Trying exact match for group: {group_text}")
-                # Try exact match first
-                if district_trie.search_exact(group_text):
-                    original = district_trie.get_full_word(group_text)
-                    logger.debug(f"Found exact district match: {group_text} -> {original}")
-                    ambiguous = False
-                    if ward_trie is not None:
-                        ambiguous = is_ambiguous_name(group_text, district_trie, ward_trie)
-                    if validate_district_match(group_text, tokens, province, ward_trie, district_trie):
-                        # Prefer non-ambiguous match, or later match if ambiguous
-                        if not ambiguous:
-                            logger.debug(f"Validated non-ambiguous district match: {group_text}")
-                            return (group_text, original, group_size)
-                        else:
-                            # Save ambiguous match, but keep looking for a better one
-                            if best_match is None or start_idx > best_match_info['start_idx']:
-                                best_match = (group_text, original, group_size)
-                                best_match_info = {'start_idx': start_idx, 'ambiguous': True}
-                    else:
-                        logger.debug(f"Failed to validate district match: {group_text}")
-        
-        # If we found an ambiguous match, return it as fallback
-        if best_match is not None:
-            logger.debug(f"Returning ambiguous district match as fallback: {best_match[0]}")
-            return best_match
-
-        logger.debug("No district match found after all attempts")
-        return (None, None, 0)
     except Exception as e:
-        logger.error(f"Error in find_district: {str(e)}")
-        return (None, None, 0)
+        logger.error(f"Error in get_hcm_numeric_district_score: {str(e)}")
+        return 0.0
 
-def find_ward(tokens, ward_trie, ward_indicators, district_trie=None):
-    """
-    Find ward in the normalized and tokenized address.
-    Now handles ambiguous names that appear in both district and ward lists.
-    """
-    try:
-        if not tokens:
-            return (None, None, 0)
-            
-        logger.debug(f"\n=== Starting ward search ===")
-        logger.debug(f"Input tokens: {tokens}")
-            
-        # Define ward indicators
-        admin_prefixes = set(ward_indicators)
+def find_district(tokens, district_trie, ward_trie=None, scoring_weights=None, is_hcm=False):
+    if not tokens:
+        logger.debug("No tokens provided for district search")
+        return None, 0.0
         
-        # First look for explicit ward indicators with numbers
-        for i, token in enumerate(tokens):
-            # Check for "phuong X" pattern
-            if token == 'phuong' and i + 1 < len(tokens):
-                next_token = tokens[i + 1]
-                if next_token.isdigit() and len(next_token) <= 2:
-                    # Don't expand numeric wards to full names
-                    return (next_token, next_token, 2)
+    logger.debug(f"Searching for district in tokens: {tokens}")
+    
+    # First check for Q+number format (e.g., Q3, Q.3)
+    for i, token in enumerate(tokens):
+        if token.lower() in ['q', 'quan'] and i + 1 < len(tokens):
+            next_token = tokens[i + 1]
+            if next_token.isdigit() and 1 <= int(next_token) <= 24:
+                logger.debug(f"Found Q+number format: {next_token} with confidence score: 2.0")
+                return next_token, 2.0  # Maximum confidence for Q+number format
+    
+    # Collect all exact matches with their scores
+    exact_matches = []
+    
+    # Then try exact match
+    for i in range(len(tokens)):
+        for j in range(i + 1, min(i + 4, len(tokens) + 1)):
+            search_text = ' '.join(tokens[i:j])
+            logger.debug(f"Trying exact match for district: {search_text}")
             
-            # Check for "pX" pattern
-            if token.startswith('p') and len(token) <= 3 and token[1:].isdigit():
-                ward_num = token[1:]
-                # Don't expand numeric wards to full names
-                return (ward_num, ward_num, 1)
-        
-        # First try to find matches at the beginning of the address
-        max_group = 4
-        for group_size in range(min(max_group, len(tokens)), 1, -1):
-            group = tokens[:group_size]
-            group_text = ' '.join(group)
-            logger.debug(f"\nTrying group at beginning: {group_text}")
+            # Check if this is a numeric district in HCM
+            if is_hcm and search_text.isdigit():
+                numeric_score = get_hcm_numeric_district_score(search_text, tokens, i)
+                if numeric_score > 0:
+                    logger.debug(f"Found numeric district in HCM: {search_text} with confidence score: {numeric_score:.2f}")
+                    exact_matches.append((search_text, numeric_score))
+                    continue  # Skip the get_detailed_confidence_score calculation
+                
+            # Try exact match
+            if district_trie.search_exact(search_text):
+                logger.debug(f"Found exact match for district: {search_text}")
+                # Get confidence score
+                score_details = get_detailed_confidence_score(
+                    search_text, 
+                    tokens, 
+                    district_trie, 
+                    ward_trie,
+                    scoring_weights=scoring_weights,
+                    component_type='district'  # Specify we're looking for a district
+                )
+                confidence = score_details['total_score']
+                logger.debug(f"Confidence score for exact match: {confidence:.2f}")
+                exact_matches.append((search_text, confidence))
+    
+    # If we have exact matches, return the one with highest confidence
+    if exact_matches:
+        # Sort by confidence score in descending order
+        exact_matches.sort(key=lambda x: x[1], reverse=True)
+        best_match, best_score = exact_matches[0]
+        logger.debug(f"Returning best exact match: {best_match} with confidence score {best_score:.2f}")
+        return best_match, best_score
+    
+    # If no exact match, try fuzzy match
+    logger.debug("No exact match found, trying fuzzy match")
+    best_match = None
+    best_score = 0.0
+    
+    for i in range(len(tokens)):
+        for j in range(i + 1, min(i + 4, len(tokens) + 1)):
+            search_text = ' '.join(tokens[i:j])
+            logger.debug(f"Trying fuzzy match for district: {search_text}")
             
-            # Try exact match first
-            if ward_trie.search_exact(group_text):
-                logger.debug(f"Found exact match for: {group_text}")
-                # Get the original form with diacritics
-                original = ward_trie.get_full_word(group_text)
-                logger.debug(f"Original form from trie: {original}")
-                if original and validate_ward_match(group_text, tokens, district_trie, ward_trie):
-                    # If the input text has diacritics, use it instead
-                    input_text = ' '.join(tokens[:group_size])
-                    logger.debug(f"Input text: {input_text}")
-                    if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                        logger.debug(f"Using input text with diacritics: {input_text}")
-                        return (group_text, input_text, group_size)
-                    logger.debug(f"Using original form from trie: {original}")
-                    return (group_text, original, group_size)
-            
-            # Try fuzzy match with higher threshold
-            candidates = ward_trie.collect_all_words()
-            if candidates:
-                result = process.extractOne(
-                    group_text,
-                    candidates,
-                    scorer=fuzz.ratio,
-                    score_cutoff=90  # Increased threshold for stricter matching
+            # Get fuzzy matches using fuzzy_search_in_trie
+            matches = fuzzy_search_in_trie(district_trie, search_text, max_dist=2)
+            if matches:
+                logger.debug(f"Found fuzzy matches for district: {matches}")
+                # Log fuzzy matches (pass all required arguments)
+                log_fuzzy_matches(
+                    search_text,
+                    [m[0] for m in matches],
+                    'district',
+                    tokens,
+                    district_trie=district_trie,
+                    ward_trie=ward_trie
                 )
                 
-                if result:
-                    matched_text, score, _ = result
-                    logger.debug(f"Found fuzzy match: {matched_text} (score: {score})")
-                    if validate_ward_match(matched_text, tokens, district_trie, ward_trie):
-                        # Get the original form with diacritics
-                        original = ward_trie.get_full_word(matched_text)
-                        logger.debug(f"Original form from trie: {original}")
-                        if original:
-                            # If the input text has diacritics, use it instead
-                            input_text = ' '.join(tokens[:group_size])
-                            logger.debug(f"Input text: {input_text}")
-                            if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                                logger.debug(f"Using input text with diacritics: {input_text}")
-                                return (matched_text, input_text, group_size)
-                            logger.debug(f"Using original form from trie: {original}")
-                            return (matched_text, original, group_size)
-        
-        # Then try to find matches with indicators
-        for i, token in enumerate(tokens):
-            if token in admin_prefixes and i + 1 < len(tokens):
-                # Look for next three tokens (increased from two)
-                next_tokens = []
-                j = i + 1
-                count = 0
-                while j < len(tokens) and count < 3:  # Increased from 2
-                    if tokens[j] not in admin_prefixes:
-                        next_tokens.append(tokens[j])
-                        count += 1
-                    j += 1
+                # Get the best match
+                match, fuzzy_score = matches[0]
+                logger.debug(f"Best fuzzy match: {match} with fuzzy score {fuzzy_score}")
                 
-                if next_tokens:
-                    text_to_search = ' '.join(next_tokens)
-                    logger.debug(f"\nTrying with indicator {token}: {text_to_search}")
-                    
-                    # Try exact match first
-                    if ward_trie.search_exact(text_to_search):
-                        logger.debug(f"Found exact match for: {text_to_search}")
-                        # Get the original form with diacritics
-                        original = ward_trie.get_full_word(text_to_search)
-                        logger.debug(f"Original form from trie: {original}")
-                        if original and validate_ward_match(text_to_search, tokens, district_trie, ward_trie):
-                            # If the input text has diacritics, use it instead
-                            input_text = ' '.join(next_tokens)
-                            logger.debug(f"Input text: {input_text}")
-                            if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                                logger.debug(f"Using input text with diacritics: {input_text}")
-                                return (text_to_search, input_text, len(next_tokens))
-                            logger.debug(f"Using original form from trie: {original}")
-                            return (text_to_search, original, len(next_tokens))
-                    
-                    # Try with reversed tokens if we have exactly 2
-                    if len(next_tokens) == 2:
-                        reversed_text = ' '.join(reversed(next_tokens))
-                        logger.debug(f"Trying reversed tokens: {reversed_text}")
-                        if ward_trie.search_exact(reversed_text):
-                            logger.debug(f"Found exact match for reversed: {reversed_text}")
-                            # Get the original form with diacritics
-                            original = ward_trie.get_full_word(reversed_text)
-                            logger.debug(f"Original form from trie: {original}")
-                            if original and validate_ward_match(reversed_text, tokens, district_trie, ward_trie):
-                                # If the input text has diacritics, use it instead
-                                input_text = ' '.join(reversed(next_tokens))
-                                logger.debug(f"Input text: {input_text}")
-                                if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                                    logger.debug(f"Using input text with diacritics: {input_text}")
-                                    return (reversed_text, input_text, len(next_tokens))
-                                logger.debug(f"Using original form from trie: {original}")
-                                return (reversed_text, original, len(next_tokens))
-                    
-                    # Try fuzzy match with higher threshold
-                    candidates = ward_trie.collect_all_words()
-                    if candidates:
-                        result = process.extractOne(
-                            text_to_search,
-                            candidates,
-                            scorer=fuzz.ratio,
-                            score_cutoff=90  # Increased threshold for stricter matching
-                        )
-                        
-                        if result:
-                            matched_text, score, _ = result
-                            logger.debug(f"Found fuzzy match: {matched_text} (score: {score})")
-                            if validate_ward_match(matched_text, tokens, district_trie, ward_trie):
-                                # Get the original form with diacritics
-                                original = ward_trie.get_full_word(matched_text)
-                                logger.debug(f"Original form from trie: {original}")
-                                if original:
-                                    # If the input text has diacritics, use it instead
-                                    input_text = ' '.join(next_tokens)
-                                    logger.debug(f"Input text: {input_text}")
-                                    if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                                        logger.debug(f"Using input text with diacritics: {input_text}")
-                                        return (matched_text, input_text, len(next_tokens))
-                                    logger.debug(f"Using original form from trie: {original}")
-                                    return (matched_text, original, len(next_tokens))
-        
-        # Finally try looking for potential ward names in the middle
-        for group_size in range(min(max_group, len(tokens)), 1, -1):
-            for start_idx in range(len(tokens) - group_size + 1):
-                # Skip if any token is an indicator
-                if any(t in admin_prefixes for t in tokens[start_idx:start_idx + group_size]):
-                    continue
-                    
-                group = tokens[start_idx:start_idx + group_size]
-                group_text = ' '.join(group)
-                logger.debug(f"\nTrying group in middle: {group_text}")
+                # Get confidence score
+                score_details = get_detailed_confidence_score(
+                    match, 
+                    tokens, 
+                    district_trie, 
+                    ward_trie,
+                    fuzzy_score=fuzzy_score,
+                    scoring_weights=scoring_weights,
+                    component_type='district'  # Specify we're looking for a district
+                )
                 
-                # Try exact match first
-                if ward_trie.search_exact(group_text):
-                    logger.debug(f"Found exact match for: {group_text}")
-                    # Get the original form with diacritics
-                    original = ward_trie.get_full_word(group_text)
-                    logger.debug(f"Original form from trie: {original}")
-                    if original and validate_ward_match(group_text, tokens, district_trie, ward_trie):
-                        # If the input text has diacritics, use it instead
-                        input_text = ' '.join(group)
-                        logger.debug(f"Input text: {input_text}")
-                        if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                            logger.debug(f"Using input text with diacritics: {input_text}")
-                            return (group_text, input_text, group_size)
-                        logger.debug(f"Using original form from trie: {original}")
-                        return (group_text, original, group_size)
+                if score_details['total_score'] > best_score:
+                    best_match = match
+                    best_score = score_details['total_score']
+                    logger.debug(f"New best match: {best_match} with confidence score {best_score:.2f}")
+    
+    if best_match:
+        logger.debug(f"Returning best fuzzy match: {best_match} with confidence score {best_score:.2f}")
+        return best_match, best_score
+    
+    logger.debug("No district match found")
+    return None, 0.0
+
+def find_ward(tokens, ward_trie, district_trie=None, scoring_weights=None):
+    if not tokens:
+        logger.debug("No tokens provided for ward search")
+        return None, 0.0
+        
+    logger.debug(f"Searching for ward in tokens: {tokens}")
+    
+    # First check for P+number format (e.g., P1, P.1)
+    for i, token in enumerate(tokens):
+        if token.lower() in ['p', 'phuong'] and i + 1 < len(tokens):
+            next_token = tokens[i + 1]
+            if next_token.isdigit() and 1 <= int(next_token) <= 20:  # HCM wards typically go up to 20
+                logger.debug(f"Found P+number format: {next_token} with confidence score: 2.0")
+                return next_token, 2.0  # Maximum confidence for P+number format
+    
+    # Collect all exact matches with their scores
+    exact_matches = []
+    
+    # Then try exact match
+    for i in range(len(tokens)):
+        for j in range(i + 1, min(i + 4, len(tokens) + 1)):
+            search_text = ' '.join(tokens[i:j])
+            logger.debug(f"Trying exact match for ward: {search_text}")
+            
+            # Try exact match
+            if ward_trie.search_exact(search_text):
+                logger.debug(f"Found exact match for ward: {search_text}")
+                # Get confidence score
+                score_details = get_detailed_confidence_score(
+                    search_text, 
+                    tokens, 
+                    district_trie, 
+                    ward_trie,
+                    scoring_weights=scoring_weights,
+                    component_type='ward'  # Specify we're looking for a ward
+                )
+                confidence = score_details['total_score']
+                logger.debug(f"Confidence score for exact match: {confidence:.2f}")
+                exact_matches.append((search_text, confidence))
+    
+    # If we have exact matches, return the one with highest confidence
+    if exact_matches:
+        # Sort by confidence score in descending order
+        exact_matches.sort(key=lambda x: x[1], reverse=True)
+        best_match, best_score = exact_matches[0]
+        logger.debug(f"Returning best exact match: {best_match} with confidence score {best_score:.2f}")
+        return best_match, best_score
+    
+    # If no exact match, try fuzzy match
+    logger.debug("No exact match found, trying fuzzy match")
+    best_match = None
+    best_score = 0.0
+    
+    for i in range(len(tokens)):
+        for j in range(i + 1, min(i + 4, len(tokens) + 1)):
+            search_text = ' '.join(tokens[i:j])
+            logger.debug(f"Trying fuzzy match for ward: {search_text}")
+            
+            # Get fuzzy matches
+            matches = fuzzy_search_in_trie(ward_trie, search_text, max_dist=2)
+            if matches:
+                logger.debug(f"Found fuzzy matches for ward: {matches}")
+                # Log fuzzy matches
+                log_fuzzy_matches(
+                    search_text,
+                    [m[0] for m in matches],
+                    'ward',
+                    tokens,
+                    district_trie=district_trie,
+                    ward_trie=ward_trie
+                )
                 
-                # Try fuzzy match with higher threshold
-                candidates = ward_trie.collect_all_words()
-                if candidates:
-                    result = process.extractOne(
-                        group_text,
-                        candidates,
-                        scorer=fuzz.ratio,
-                        score_cutoff=90  # Increased threshold for stricter matching
-                    )
-                    
-                    if result:
-                        matched_text, score, _ = result
-                        logger.debug(f"Found fuzzy match: {matched_text} (score: {score})")
-                        if validate_ward_match(matched_text, tokens, district_trie, ward_trie):
-                            # Get the original form with diacritics
-                            original = ward_trie.get_full_word(matched_text)
-                            logger.debug(f"Original form from trie: {original}")
-                            if original:
-                                # If the input text has diacritics, use it instead
-                                input_text = ' '.join(group)
-                                logger.debug(f"Input text: {input_text}")
-                                if any(c in 'àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ' for c in input_text):
-                                    logger.debug(f"Using input text with diacritics: {input_text}")
-                                    return (matched_text, input_text, group_size)
-                                logger.debug(f"Using original form from trie: {original}")
-                                return (matched_text, original, group_size)
-
-        logger.debug("No ward match found")
-        return (None, None, 0)
-    except Exception as e:
-        logger.error(f"Error in find_ward: {str(e)}")
-        return (None, None, 0)
-
-def parse_address(address: str, province_trie: Trie, district_trie: Trie, ward_trie: Trie) -> dict:
-    """
-    Parse an address string to extract province, district, and ward components.
-    Uses a hierarchical approach: province -> district -> ward.
-    """
-    try:
-        # Initialize result structure
-        result = {
-            'province': None,
-            'district': None,
-            'ward': None,
-            'context': {
-                'is_hcm': False,
-                'normalized_tokens': [],
-                'error': None
-            }
-        }
-        
-        logger.debug(f"Parsing address: {address}")
-        
-        # 1. Normalize input text and detect HCM context
-        tokens, is_hcmc = normalize_text(address)
-        if not tokens:
-            logger.debug("No tokens found after normalization")
-            result['context']['error'] = "Empty or invalid address"
-            return result
-            
-        logger.debug(f"Normalized tokens: {tokens}")
-        logger.debug(f"Is HCM context: {is_hcmc}")
-        
-        result['context']['normalized_tokens'] = tokens
-        result['context']['is_hcm'] = is_hcmc
-        
-        # 2. Define indicator words for each component
-        province_indicators = ['tinh', 'thanh pho', 'tp']
-        district_indicators = ['huyen', 'quan', 'q', 'thi xa', 'tx']
-        ward_indicators = ['phuong', 'xa', 'thi tran', 'p', 'tt']
-        
-        # 3. Find components in hierarchical order
-        # First find province
-        logger.debug("Starting province search")
-        matched_province, original_province, consumed_province = find_province(
-            tokens, province_trie, province_indicators
-        )
-        if original_province:
-            logger.debug(f"Found province: {original_province}")
-            result['province'] = original_province
-        else:
-            logger.debug("No province found")
-            
-        # Then find district (considering HCM context and province)
-        logger.debug("Starting district search")
-        matched_district, original_district, consumed_district = find_district(
-            tokens, district_trie, district_indicators, result['province'], ward_trie
-        )
-        
-        # Handle HCM numeric districts
-        if is_hcmc and matched_district:
-            if matched_district.isdigit():
-                # For HCM numeric districts, use the number directly
-                logger.debug(f"Using HCM numeric district: {matched_district}")
-                result['district'] = matched_district
-            else:
-                logger.debug(f"Using HCM district: {original_district}")
-                result['district'] = original_district
-        else:
-            if original_district:
-                logger.debug(f"Using district: {original_district}")
-                result['district'] = original_district
-            else:
-                logger.debug("No district found")
-            
-        # Finally find ward
-        logger.debug("Starting ward search")
-        matched_ward, original_ward, consumed_ward = find_ward(
-            tokens, ward_trie, ward_indicators, district_trie
-        )
-        if original_ward:
-            logger.debug(f"Found ward: {original_ward}")
-            result['ward'] = original_ward
-        else:
-            logger.debug("No ward found")
-            
-        # 4. Post-processing validation
-        # If we found HCM but no province, set it
-        if is_hcmc and not result['province']:
-            logger.debug("Setting HCM as province")
-            result['province'] = 'Hồ Chí Minh'
-            
-        logger.debug(f"Final parsing result: {result}")
-        return result
-        
-    except Exception as e:
-        # Handle any errors during parsing
-        logger.error(f"Error during address parsing: {str(e)}")
-        return {
-            'province': None,
-            'district': None,
-            'ward': None,
-            'context': {
-                'is_hcm': False,
-                'normalized_tokens': tokens if 'tokens' in locals() else [],
-                'error': str(e)
-            }
-        }
-
+                # Get the best match
+                match, fuzzy_score = matches[0]
+                logger.debug(f"Best fuzzy match: {match} with fuzzy score {fuzzy_score}")
+                
+                # Get confidence score
+                score_details = get_detailed_confidence_score(
+                    match, 
+                    tokens, 
+                    district_trie, 
+                    ward_trie,
+                    fuzzy_score=fuzzy_score,
+                    scoring_weights=scoring_weights,
+                    component_type='ward'  # Specify we're looking for a ward
+                )
+                
+                if score_details['total_score'] > best_score:
+                    best_match = match
+                    best_score = score_details['total_score']
+                    logger.debug(f"New best match: {best_match} with confidence score {best_score:.2f}")
+    
+    if best_match:
+        logger.debug(f"Returning best fuzzy match: {best_match} with confidence score {best_score:.2f}")
+        return best_match, best_score
+    
+    logger.debug("No ward match found")
+    return None, 0.0
 
 ##############################################################
 # 6. MAIN DEMO
 ##############################################################
 
-def parse_location_components(
-    address: str,
-    province_trie: Trie = None,
-    district_trie: Trie = None,
-    ward_trie: Trie = None,
-    province_indicators: list = None,
-    district_indicators: list = None,
-    ward_indicators: list = None
-) -> dict:
+def parse_location_components(text, province_trie, district_trie, ward_trie, scoring_weights=None, validation_thresholds=None, disable_file_logging=False):
     """
-    Parse an address string into its components (province, district, ward).
+    Parse location components from text using all available components:
+    - Confidence Score System
+    - Fuzzy Matching
+    - Standardized Weights
+    - Threshold Validation
+    - Ambiguity Checking
     
     Args:
-        address (str): The address string to parse
-        province_trie (Trie, optional): Trie containing province data
-        district_trie (Trie, optional): Trie containing district data
-        ward_trie (Trie, optional): Trie containing ward data
-        province_indicators (list, optional): List of province indicator words
-        district_indicators (list, optional): List of district indicator words
-        ward_indicators (list, optional): List of ward indicator words
-        
-    Returns:
-        dict: A dictionary containing the parsed components:
-            {
-                'province': str or None,
-                'district': str or None,
-                'ward': str or None,
-                'context': {
-                    'is_hcm': bool,
-                    'normalized_tokens': list,
-                    'error': str or None
-                }
-            }
+        text: The input text to parse
+        province_trie: Trie containing province data
+        district_trie: Trie containing district data
+        ward_trie: Trie containing ward data
+        scoring_weights: Optional dictionary of scoring weights
+        validation_thresholds: Optional dictionary of validation thresholds
+        disable_file_logging: If True, disable logging to file
     """
-    try:
-        # Initialize result structure
-        result = {
-            'province': None,
-            'district': None,
-            'ward': None,
-            'context': {
-                'is_hcm': False,
-                'normalized_tokens': [],
-                'error': None
+    # Set up logging based on parameter
+    setup_logging(disable_file_logging)
+    
+    # Set default weights if not provided
+    if scoring_weights is None:
+        scoring_weights = {
+            'fuzzy_score': 0.3,        # Reduced from 0.4 to give less weight to fuzzy matches
+            'exact_match': 0.6,        # Increased from 0.5 to prioritize exact matches
+            'position_bonus': {
+                'beginning': 0.3,      # Reduced from 0.4 to be less strict about position
+                'middle': 0.4          # Reduced from 0.5 to be less strict about position
+            },
+            'length_bonus': 0.4,       # Increased from 0.2 to favor multi-word matches
+            'non_ambiguous_bonus': 0.2, # Reduced from 0.3 to be less strict about ambiguity
+            'comma_bonus': 0.3,        # Increased from 0.2 to better handle comma-separated addresses
+            'indicator_bonus': 0.4     # Increased from 0.3 to better handle indicators
+        }
+    
+    # Set default thresholds if not provided
+    if validation_thresholds is None:
+        validation_thresholds = {
+            'ward': {
+                'non_ambiguous': 0.8,      # Increased from 0.7
+                'ambiguous_beginning': 0.9, # Increased from 0.7
+                'ambiguous_middle': 0.8     # Increased from 0.7
+            },
+            'district': {
+                'non_ambiguous': 0.8,      # Increased from 0.7
+                'ambiguous_beginning': 0.9, # Increased from 0.7
+                'ambiguous_middle': 0.8     # Increased from 0.7
             }
         }
-        
-        logger.debug(f"Parsing address: {address}")
-        
-        # 1. Load dictionary data and build tries if not provided
-        if not all([province_trie, district_trie, ward_trie]):
-            province_list, district_list, ward_list = load_dictionary_files()
-            
-            if not province_trie:
-                province_trie = build_trie_from_list(province_list)
-            if not district_trie:
-                district_trie = build_trie_from_list(district_list)
-            if not ward_trie:
-                ward_trie = build_trie_from_list(ward_list)
-        
-        # 2. Set default indicators if not provided
-        if province_indicators is None:
-            province_indicators = ['tinh', 'thanh pho', 'tp']
-        if district_indicators is None:
-            district_indicators = ['huyen', 'quan', 'q', 'thi xa', 'tx']
-        if ward_indicators is None:
-            ward_indicators = ['phuong', 'xa', 'thi tran', 'p', 'tt']
-        
-        # 3. Normalize input text and detect HCM context
-        tokens, is_hcmc = normalize_text(address)
-        if not tokens:
-            logger.debug("No tokens found after normalization")
-            result['context']['error'] = "Empty or invalid address"
-            return result
-            
-        logger.debug(f"Normalized tokens: {tokens}")
-        logger.debug(f"Is HCM context: {is_hcmc}")
-            
-        result['context']['normalized_tokens'] = tokens
-        result['context']['is_hcm'] = is_hcmc
-        
-        # 4. Find components in hierarchical order
-        # First find province
-        logger.debug("Starting province search")
-        matched_province, original_province, consumed_province = find_province(
-            tokens, province_trie, province_indicators
-        )
-        if original_province:
-            logger.debug(f"Found province: {original_province}")
-            result['province'] = original_province
-        else:
-            logger.debug("No province found")
-            
-        # Then find district (considering HCM context and province)
-        logger.debug("Starting district search")
-        matched_district, original_district, consumed_district = find_district(
-            tokens, district_trie, district_indicators, result['province'], ward_trie
-        )
-        
-        # Handle HCM numeric districts
-        if is_hcmc and matched_district:
-            if matched_district.isdigit():
-                # For HCM numeric districts, use the number directly
-                logger.debug(f"Using HCM numeric district: {matched_district}")
-                result['district'] = matched_district
-            else:
-                logger.debug(f"Using HCM district: {original_district}")
-                result['district'] = original_district
-        else:
-            if original_district:
-                logger.debug(f"Using district: {original_district}")
-                result['district'] = original_district
-            else:
-                logger.debug("No district found")
-            
-        # Finally find ward
-        logger.debug("Starting ward search")
-        matched_ward, original_ward, consumed_ward = find_ward(
-            tokens, ward_trie, ward_indicators, district_trie
-        )
-        if original_ward:
-            logger.debug(f"Found ward: {original_ward}")
-            result['ward'] = original_ward
-        else:
-            logger.debug("No ward found")
-            
-        # 5. Post-processing validation
-        # If we found HCM but no province, set it
-        if is_hcmc and not result['province']:
-            logger.debug("Setting HCM as province")
-            result['province'] = 'Hồ Chí Minh'
-            
-        logger.debug(f"Final parsing result: {result}")
-        return result
-        
-    except Exception as e:
-        # Handle any errors during parsing
-        logger.error(f"Error during address parsing: {str(e)}")
+    
+    # Normalize input text and detect HCM context
+    normalized_tokens, is_hcm = normalize_text(text)
+    if not normalized_tokens:
         return {
             'province': None,
             'district': None,
             'ward': None,
-            'context': {
-                'is_hcm': False,
-                'normalized_tokens': tokens if 'tokens' in locals() else [],
-                'error': str(e)
-            }
+            'is_hcm': False,
+            'normalized_tokens': []
         }
-
-# Update the demo functions to use the new function signature
-def run_demo():
-    print("\n=== Vietnamese Address Parser Demo ===\n")
     
-    # Load dictionary data and build tries once
-    province_list, district_list, ward_list = load_dictionary_files()
-    province_trie = build_trie_from_list(province_list)
-    district_trie = build_trie_from_list(district_list)
-    ward_trie = build_trie_from_list(ward_list)
+    # Initialize results
+    province = None
+    district = None
+    ward = None
     
-    # Sample addresses to parse
-    sample_addresses = [
-        "154/4/81 Nguyễn - Phúc Chu, P15, TB, TP. Hồ Chí Minh",
-        "TT Tan Binh Huyen Yen Son, Tuyenn Quangg",
-        "p1, q3, tp.hochiminh",
-        ", Tân Phươc, Tin GJiang"
-    ]
-
-    print("=== Parsing Sample Addresses ===\n")
-    for i, addr in enumerate(sample_addresses, 1):
-        print(f"Example {i}:")
-        print(f"Input:    {addr}")
+    
+    # Special handling for HCM context
+    if is_hcm:
+        province = 'Hồ Chí Minh'
+    
+    # If no HCM context or no numeric district found, proceed with normal parsing
+    if not province:
+        # 1. Find Province
+        # First try exact match
+        for i in range(len(normalized_tokens)):
+            for j in range(i + 1, min(i + 4, len(normalized_tokens) + 1)):
+                search_text = ' '.join(normalized_tokens[i:j])
+                if province_trie.search_exact(search_text):
+                    province = province_trie.get_full_word(search_text)
+                    break
+            if province:
+                break
         
-        # Parse the address using the new function with pre-built tries
-        result = parse_location_components(
-            addr,
-            province_trie=province_trie,
-            district_trie=district_trie,
-            ward_trie=ward_trie
-        )
-        
-        # Format the output
-        print("\nParsed Components:")
-        print(f"  Province: {result['province'] or 'Not found'}")
-        print(f"  District: {result['district'] or 'Not found'}")
-        print(f"  Ward:     {result['ward'] or 'Not found'}")
-        
-        # Print context information
-        print("\nContext:")
-        print(f"  HCM Context: {'Yes' if result['context']['is_hcm'] else 'No'}")
-        print(f"  Normalized Tokens: {' '.join(result['context']['normalized_tokens'])}")
-        if result['context']['error']:
-            print(f"  Error: {result['context']['error']}")
-        
-        print("\n" + "="*50 + "\n")
+        # If no exact match, try fuzzy match
+        if not province:
+            for i in range(len(normalized_tokens)):
+                for j in range(i + 1, min(i + 4, len(normalized_tokens) + 1)):
+                    search_text = ' '.join(normalized_tokens[i:j])
+                    matches = fuzzy_search_in_trie(province_trie, search_text, max_dist=2)
+                    if matches:
+                        province = province_trie.get_full_word(matches[0][0])
+                        break
+                if province:
+                    break
+    
+    # 2. Find District using find_district with confidence score
+    district, district_score = find_district(
+        normalized_tokens, 
+        district_trie, 
+        ward_trie, 
+        scoring_weights=scoring_weights,
+        is_hcm=is_hcm
+    )
+    
+    # Validate district match
+    if district and validate_district_match(district, normalized_tokens, district_score, validation_thresholds, province, ward_trie, district_trie):
+        district = district_trie.get_full_word(district)
+    else:
+        district = None
+    
+    # 3. Find Ward using find_ward with confidence score
+    ward, ward_score = find_ward(
+        normalized_tokens, 
+        ward_trie, 
+        district_trie, 
+        scoring_weights=scoring_weights
+    )
+    
+    # Validate ward match
+    if ward and validate_ward_match(ward, normalized_tokens, ward_score, validation_thresholds, district_trie, ward_trie):
+        ward = ward_trie.get_full_word(ward)
+    else:
+        ward = None
+    
+    return {
+        'province': province,
+        'district': district,
+        'ward': ward,
+        'is_hcm': is_hcm,
+        'normalized_tokens': normalized_tokens
+    }
 
 def run_demo_test_file():
     """
     Run first 100 tests from test.json file and compare results with expected output.
-    Prints detailed information for each test case.
+    Uses the parse_location_components function with confidence scoring.
     """
     import json
     from collections import defaultdict
+    import traceback
+    
+    # Configure logging
+    setup_logging(disable_file_logging=False)
+    logger = logging.getLogger('address_parser')
     
     print("\n=== Running First 100 Test Cases from test.json ===\n")
     
-    # Load dictionary data and build tries once
-    province_list, district_list, ward_list = load_dictionary_files()
-    province_trie = build_trie_from_list(province_list)
-    district_trie = build_trie_from_list(district_list)
-    ward_trie = build_trie_from_list(ward_list)
-    
-    # Load test cases
     try:
-        with open('test.json', 'r', encoding='utf-8') as f:
-            test_cases = json.load(f)[:100]  # Only take first 100 test cases
+        # Load dictionary data and build tries once
+        province_list, district_list, ward_list = load_dictionary_files()
+        print(f"\nLoaded dictionary data:")
+        print(f"Provinces: {len(province_list)}")
+        print(f"Districts: {len(district_list)}")
+        print(f"Wards: {len(ward_list)}")
+        
+        province_trie = build_trie_from_list(province_list)
+        district_trie = build_trie_from_list(district_list)
+        ward_trie = build_trie_from_list(ward_list)
+        
+        # Verify trie contents
+        print("\nTrie contents:")
+        print(f"Provinces in trie: {len(province_trie.collect_all_words())}")
+        print(f"Districts in trie: {len(district_trie.collect_all_words())}")
+        print(f"Wards in trie: {len(ward_trie.collect_all_words())}")
+        
+        # Load test cases
+        try:
+            with open('test.json', 'r', encoding='utf-8') as f:
+                test_cases = json.load(f)  # Only take first 10 test cases
+                print(f"\nSuccessfully loaded {len(test_cases)} test cases")
+        except Exception as e:
+            print(f"Error loading test.json: {e}")
+            return
+
+        # Run tests
+        total_tests = len(test_cases)
+        successful = 0
+        failed = 0
+        failures = defaultdict(list)
+
+        print(f"\nRunning {total_tests} test cases...")
+        
+        for i, test_case in enumerate(test_cases, 1):
+            try:
+                print(f"\nProcessing test case {i} of {total_tests}")
+                address = test_case['text']
+                expected = test_case['result']
+                
+                print(f"\nTest Case {i}:")
+                print(f"Input address: {address}")
+                print(f"Expected result: {json.dumps(expected, ensure_ascii=False)}")
+
+                
+                print("Starting address parsing...")
+                # Parse address using our new function
+                result = parse_location_components(
+                    address,
+                    province_trie=province_trie,
+                    district_trie=district_trie,
+                    ward_trie=ward_trie,
+                    disable_file_logging=False,  # Enable logging for this test case
+                    validation_thresholds = {
+                        "ward": {
+                            "non_ambiguous": 0.75,
+                            "ambiguous_beginning": 0.85,
+                            "ambiguous_middle": 0.75
+                        },
+                        "district": {
+                            "non_ambiguous": 0.75,
+                            "ambiguous_beginning": 0.85,
+                            "ambiguous_middle": 0.75
+                        }
+                    },
+                    scoring_weights={
+                        "fuzzy_score": 0.15,
+                        "exact_match": 0.35,
+                        "position_bonus": {
+                            "beginning": 0.25,
+                            "middle": 0.3
+                        },
+                        "length_bonus": 0.25,
+                        "non_ambiguous_bonus": 0.1,
+                        "comma_bonus": 0.25,
+                        "indicator_bonus": 0.25
+                    }
+                )
+                print("Address parsing completed")
+                
+                # Compare results
+                province_match = result['province'] == expected['province']
+                district_match = result['district'] == expected['district']
+                ward_match = result['ward'] == expected['ward']
+                
+                print("\nActual result:")
+                print(f"Province: {result['province']} {'✓' if province_match else '✗'}")
+                print(f"District: {result['district']} {'✓' if district_match else '✗'}")
+                print(f"Ward: {result['ward']} {'✓' if ward_match else '✗'}")
+                
+                if province_match and district_match and ward_match:
+                    successful += 1
+                    print("\nStatus: SUCCESS ✓")
+                else:
+                    failed += 1
+                    failure_reasons = []
+                    
+                    if not province_match:
+                        failure_reasons.append(f"Province: expected '{expected['province']}', got '{result['province']}'")
+                    if not district_match:
+                        failure_reasons.append(f"District: expected '{expected['district']}', got '{result['district']}'")
+                    if not ward_match:
+                        failure_reasons.append(f"Ward: expected '{expected['ward']}', got '{result['ward']}'")
+                    
+                    print("\nStatus: FAILED ✗")
+                    print(f"Failure reasons: {'; '.join(failure_reasons)}")
+                    
+                    failures[address] = failure_reasons
+                
+                print("-" * 80)
+                
+            except Exception as e:
+                print(f"Error processing test case {i}: {str(e)}")
+                logger.error(f"Error processing test case {i}: {str(e)}")
+                logger.error(traceback.format_exc())  # Add stack trace to log file
+                failed += 1
+                failures[address] = [f"Error: {str(e)}"]
+                continue
+
+        # Print summary
+        print("\n=== Test Results Summary ===")
+        print(f"Total tests: {total_tests}")
+        print(f"Successful: {successful}")
+        print(f"Failed: {failed}")
+        print(f"Success rate: {(successful/total_tests)*100:.2f}%")
+        
+        if failed > 0:
+            print("\nFailed test cases:")
+            for address, reasons in failures.items():
+                print(f"\nAddress: {address}")
+                print(f"Reasons: {'; '.join(reasons)}")
+                
     except Exception as e:
-        print(f"Error loading test.json: {e}")
-        return
-
-    # Run tests
-    total_tests = len(test_cases)
-    successful = 0
-    failed = 0
-    failures = defaultdict(list)
-
-    print(f"Running {total_tests} test cases...\n")
-    
-    for i, test_case in enumerate(test_cases, 1):
-        address = test_case['text']
-        expected = test_case['result']
-        
-        print(f"\nTest Case {i}:")
-        print(f"Input address: {address}")
-        print("Expected result:", expected)
-        
-        # Parse the address using the new function with pre-built tries
-        result = parse_location_components(
-            address,
-            province_trie=province_trie,
-            district_trie=district_trie,
-            ward_trie=ward_trie
-        )
-        
-        # Print normalized tokens and HCM context
-        print("\nParsing details:")
-        print(f"Normalized tokens: {' '.join(result['context']['normalized_tokens'])}")
-        print(f"HCM context: {'Yes' if result['context']['is_hcm'] else 'No'}")
-        
-        # Compare results
-        province_match = result['province'] == expected['province']
-        district_match = result['district'] == expected['district']
-        ward_match = result['ward'] == expected['ward']
-        
-        print("\nActual result:")
-        print(f"Province: {result['province']} {'✓' if province_match else '✗'}")
-        print(f"District: {result['district']} {'✓' if district_match else '✗'}")
-        print(f"Ward: {result['ward']} {'✓' if ward_match else '✗'}")
-        
-        if province_match and district_match and ward_match:
-            successful += 1
-            print("\nStatus: SUCCESS ✓")
-        else:
-            failed += 1
-            failure_reasons = []
-            if not province_match:
-                failure_reasons.append(f"Province: expected '{expected['province']}', got '{result['province']}'")
-            if not district_match:
-                failure_reasons.append(f"District: expected '{expected['district']}', got '{result['district']}'")
-            if not ward_match:
-                failure_reasons.append(f"Ward: expected '{expected['ward']}', got '{result['ward']}'")
-            
-            failures[address] = failure_reasons
-            print("\nStatus: FAILED ✗")
-            print("Failure reasons:", '; '.join(failure_reasons))
-        
-        print("-" * 80)
-
-    # Print summary
-    print("\n=== Test Results Summary ===")
-    print(f"Total tests: {total_tests}")
-    print(f"Successful: {successful}")
-    print(f"Failed: {failed}")
-    print(f"Success rate: {(successful/total_tests)*100:.2f}%")
-    
-    if failed > 0:
-        print("\nFailed test cases:")
-        for address, reasons in failures.items():
-            print(f"\nAddress: {address}")
-            print("Reasons:", '; '.join(reasons))
+        print(f"Critical error in run_demo_test_file: {str(e)}")
+        logger.error(f"Critical error in run_demo_test_file: {str(e)}")
+        logger.error(traceback.format_exc())  # Add stack trace to log file
 
 if __name__ == "__main__":
     # Uncomment one of these to run either the demo or the test file

@@ -1,0 +1,114 @@
+[
+  {
+    "timestamp": "2025-05-25 00:54:16",
+    "success_rate": 0.7666666666666667,
+    "weights": {
+      "fuzzy_score": 0.15,
+      "exact_match": 0.35,
+      "position_bonus": {
+        "beginning": 0.25,
+        "middle": 0.3
+      },
+      "length_bonus": 0.25,
+      "non_ambiguous_bonus": 0.1,
+      "comma_bonus": 0.25,
+      "indicator_bonus": 0.25
+    },
+    "thresholds": {
+      "ward": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.85,
+        "ambiguous_middle": 0.75
+      },
+      "district": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.85,
+        "ambiguous_middle": 0.75
+      }
+    }
+  },
+  {
+    "timestamp": "2025-05-25 00:02:59",
+    "success_rate": 0.7633333333333333,
+    "weights": {
+      "fuzzy_score": 0.15,
+      "exact_match": 0.3,
+      "position_bonus": {
+        "beginning": 0.2,
+        "middle": 0.3
+      },
+      "length_bonus": 0.25,
+      "non_ambiguous_bonus": 0.2,
+      "comma_bonus": 0.25,
+      "indicator_bonus": 0.25
+    },
+    "thresholds": {
+      "ward": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.85,
+        "ambiguous_middle": 0.75
+      },
+      "district": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.85,
+        "ambiguous_middle": 0.85
+      }
+    }
+  },
+  {
+    "timestamp": "2025-05-25 00:07:40",
+    "success_rate": 0.7633333333333333,
+    "weights": {
+      "fuzzy_score": 0.15,
+      "exact_match": 0.3,
+      "position_bonus": {
+        "beginning": 0.2,
+        "middle": 0.3
+      },
+      "length_bonus": 0.25,
+      "non_ambiguous_bonus": 0.2,
+      "comma_bonus": 0.25,
+      "indicator_bonus": 0.25
+    },
+    "thresholds": {
+      "ward": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.85,
+        "ambiguous_middle": 0.75
+      },
+      "district": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.9,
+        "ambiguous_middle": 0.75
+      }
+    }
+  },
+  {
+    "timestamp": "2025-05-25 00:04:29",
+    "success_rate": 0.7066666666666667,
+    "weights": {
+      "fuzzy_score": 0.15,
+      "exact_match": 0.3,
+      "position_bonus": {
+        "beginning": 0.2,
+        "middle": 0.3
+      },
+      "length_bonus": 0.25,
+      "non_ambiguous_bonus": 0.2,
+      "comma_bonus": 0.25,
+      "indicator_bonus": 0.25
+    },
+    "thresholds": {
+      "ward": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.85,
+        "ambiguous_middle": 0.75
+      },
+      "district": {
+        "non_ambiguous": 0.75,
+        "ambiguous_beginning": 0.9,
+        "ambiguous_middle": 0.85
+      }
+    }
+  }
+]
