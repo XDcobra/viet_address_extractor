@@ -61,13 +61,12 @@ class TrieNode:
     Attributes:
         children (dict): A dictionary mapping a character to a TrieNode.
         is_terminal (bool): Whether this node represents the end of a valid word.
-        full_word (str or None): Optionally store the original word (with diacritics) 
-                                 if this node is the end of a valid entry.
+        full_words (list): List of original words (with diacritics) if this node is the end of a valid entry.
     """
     def __init__(self):
         self.children = {}
         self.is_terminal = False
-        self.full_word = None
+        self.full_words = []  # Changed from full_word to full_words list
 
 
 class Trie:
@@ -105,7 +104,13 @@ class Trie:
             current.is_terminal = True
             # Store the original name if provided
             if original_name:
-                current.full_word = original_name
+                # Only add if not already in the list to avoid duplicates
+                if original_name not in current.full_words:
+                    current.full_words.append(original_name)
+                    # Debug print for Tân Hòa cases
+                    if 'tan hoa' in word.lower():
+                        print(f"Inserting '{original_name}' with normalized form '{word}'")
+                        print(f"Current full_words for this node: {current.full_words}")
             # logger.debug(f"Inserted word: {word} (original: {original_name})")
         except Exception as e:
             logger.error(f"Error inserting word '{word}': {str(e)}")
@@ -131,25 +136,68 @@ class Trie:
             logger.error(f"Error in exact search for '{word}': {str(e)}")
             return False
 
-    def get_full_word(self, word):
+    def get_full_word(self, word, original_text=None):
         """
         Retrieve the original form of 'word' if it exists in the trie.
+        If original_text is provided, try to find the best matching diacritics version.
         
-        :param word: The normalized string to look up.
-        :return: The stored original form if found, otherwise None.
+        Args:
+            word: The normalized string to look up
+            original_text: Optional original text with diacritics to use as a hint
+        
+        Returns:
+            The best matching original form if found, otherwise None
         """
         try:
+            # If we have original text, first try to find a longer form
+            if original_text and ' ' in original_text:
+                # Try to find the longer form first
+                longer_word = remove_diacritics(original_text.lower())
+                current = self.root
+                for char in longer_word:
+                    if char not in current.children:
+                        break
+                    current = current.children[char]
+                else:  # If we found the longer form
+                    if current.is_terminal and current.full_words:
+                        # Use rapidfuzz to find the closest match
+                        result = process.extractOne(
+                            original_text,
+                            current.full_words,
+                            scorer=fuzz.ratio
+                        )
+                        if result:
+                            return result[0]
+            
+            # If longer form not found or no original text, try the original word
             current = self.root
             for char in word:
                 if char not in current.children:
                     logger.debug(f"Full word lookup failed for: {word}")
                     return None
                 current = current.children[char]
-            if current.is_terminal:
-                logger.debug(f"Found full word for {word}: {current.full_word}")
-                return current.full_word
+            
+            if current.is_terminal and current.full_words:
+                # If we have original text, use it to find the best match
+                if original_text:
+                    # Use rapidfuzz to find the closest match
+                    result = process.extractOne(
+                        original_text,
+                        current.full_words,
+                        scorer=fuzz.ratio
+                    )
+                    if result:
+                        # Debug print for Tân Hòa cases
+                        if 'tan hoa' in word.lower():
+                            print(f"Best match found: {result[0]} with score {result[1]}")
+                        return result[0]
+                
+                # If no original text or no good match found, return the first version
+                return current.full_words[0]
+                
             logger.debug(f"No full word found for: {word}")
             return None
+            
         except Exception as e:
             logger.error(f"Error getting full word for '{word}': {str(e)}")
             return None
@@ -165,7 +213,7 @@ class Trie:
 
             def dfs(node, path):
                 if node.is_terminal:
-                    results.append(path)
+                    results.extend(node.full_words)
                 for c, child in node.children.items():
                     dfs(child, path + c)
 
@@ -216,6 +264,7 @@ def fuzzy_search_in_trie(trie, word, max_dist=1, expected=None):
     1. Numeric districts (especially in HCM)
     2. Compound names with diacritics
     3. Short word exact matching
+    4. Multiple matches with different diacritics
     
     Args:
         trie: A Trie object containing valid words
@@ -331,6 +380,13 @@ def fuzzy_search_in_trie(trie, word, max_dist=1, expected=None):
     # For single-word queries
     else:
         word = word_tokens[0]
+        # First try exact match with diacritics
+        for candidate in candidates:
+            original_form = trie.get_full_word(candidate)
+            if original_form and original_form.lower() == word.lower():
+                return [(candidate, 0)]
+        
+        # If no exact match, try fuzzy match
         for candidate in candidates:
             # For short words (≤3 chars), require exact match
             if len(word) <= 3 or len(candidate) <= 3:
@@ -655,188 +711,284 @@ def normalize_text(text):
     5) Remove diacritics
     6) Normalize spaces and split into tokens
     7) Standardize place names using official dictionaries
+    
+    Returns:
+        tuple: (normalized_tokens, original_tokens, is_hcm, comma_separated_groups)
     """
     if not text:
-        return [], False
+        return [], [], False, []
     
-    # 1. Preprocess malformed text
-    # Fix missing spaces between words by looking for camelCase patterns
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    text = re.sub(r'([A-Z])([A-Z][a-z])', r'\1 \2', text)
+    # Store original text for later tokenization
+    original_text = text
     
-    # Fix common malformed patterns
-    text = re.sub(r'([A-Za-z])(\d+)([A-Za-z])', r'\1 \2 \3', text)  # Split letter-number-letter
-    text = re.sub(r'(\d+)([A-Za-z])', r'\1 \2', text)  # Split number-letter
-    text = re.sub(r'([A-Za-z])(\d+)', r'\1 \2', text)  # Split letter-number
+    # First split by commas to preserve comma information
+    comma_parts = [part.strip() for part in text.split(',')]
     
-    # Fix common administrative unit prefixes that might be stuck to words
-    # Only split if the prefix is followed by a space or end of string
-    admin_prefixes = ['huyen', 'quan', 'phuong', 'xa', 'thi', 'tran', 'tinh', 'thanh', 'pho']
-    pattern = '|'.join(f'({prefix})' for prefix in admin_prefixes)
-    text = re.sub(f'({pattern})(?=\s|$)', r'\1 ', text, flags=re.IGNORECASE)
+    # Process each comma-separated part
+    all_normalized_tokens = []
+    all_original_tokens = []
+    comma_groups = []  # Will store which tokens belong to which comma group
     
-    # Remove dots at word boundaries that aren't part of abbreviations
-    text = re.sub(r'(?<=[^A-Za-z0-9])\.|\.(?=[^A-Za-z0-9])', ' ', text)
+    current_group = 0
+    for part in comma_parts:
+        # Process this part
+        part = part.strip()
+        if not part:
+            continue
+            
+        # Store original part before any modifications
+        original_part = part
     
-    # Fix common typos in district names
-    typo_fixes = {
-        r'bao la\.?': 'bao lam',
-        r'ph\d+o': 'pho',
-        r'hxuan': 'huyen xuan',
-        r'tphô': 'thanh pho',
-        r'ph\d+ố': 'pho',
-        r'q\.(\d+)': r'quan \1',
-        r'p\.(\d+)': r'phuong \1',
-        r'h\.([a-zđ])': r'huyen \1',
-        r'tx\.([a-zđ])': r'thi xa \1',
-        r'tt\.([a-zđ])': r'thi tran \1',
-    }
+        # 1. Preprocess malformed text
+        # Fix missing spaces between words by looking for camelCase patterns
+        part = re.sub(r'([a-z])([A-Z])', r'\1 \2', part)
+        part = re.sub(r'([A-Z])([A-Z][a-z])', r'\1 \2', part)
     
-    for pattern, replacement in typo_fixes.items():
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        # Fix common malformed patterns
+        part = re.sub(r'([A-Za-z])(\d+)([A-Za-z])', r'\1 \2 \3', part)  # Split letter-number-letter
+        part = re.sub(r'(\d+)([A-Za-z])', r'\1 \2', part)  # Split number-letter
+        part = re.sub(r'([A-Za-z])(\d+)', r'\1 \2', part)  # Split letter-number
+    
+        # Fix common administrative unit prefixes that might be stuck to words
+        admin_prefixes = ['huyen', 'quan', 'phuong', 'xa', 'thi', 'tran', 'tinh', 'thanh', 'pho']
+        pattern = '|'.join(f'({prefix})' for prefix in admin_prefixes)
+        part = re.sub(f'({pattern})(?=\s|$)', r'\1 ', part, flags=re.IGNORECASE)
+    
+        # Remove dots at word boundaries that aren't part of abbreviations
+        part = re.sub(r'(?<=[^A-Za-z0-9])\.|\.(?=[^A-Za-z0-9])', ' ', part)
         
-    # 2. Convert to lowercase
-    text = text.lower()
+        # 2. Convert to lowercase for normalized version
+        normalized_part = part.lower()
 
-    # 3. Check for HCM context and standardize variations
-    is_hcmc, text = detect_hcm_context(text)
+        # 3. Check for HCM context and standardize variations
+        is_hcmc, normalized_part = detect_hcm_context(normalized_part)
 
-    # 4. Replace punctuation with space, preserving dots for abbreviations
-    text = re.sub(r'[,:/\\\-()]+', ' ', text)
+        # 4. Replace punctuation with space, preserving dots for abbreviations
+        normalized_part = re.sub(r'[,:/\\\-()]+', ' ', normalized_part)
 
-    # 5. Handle special abbreviations before removing dots
-    # Common province abbreviations
-    province_abbrev = {
-        r'\bt\.?\s*giang\b': 'tien giang',
-        r'\bb\.?\s*duong\b': 'binh duong',
-        r'\bb\.?\s*dinh\b': 'binh dinh',
-        r'\bb\.?\s*thuan\b': 'binh thuan',
-        r'\bb\.?\s*phuoc\b': 'binh phuoc',
-        r'\bd\.?\s*nai\b': 'dong nai',
-        r'\bh\.?\s*giang\b': 'hau giang',
-        r'\bk\.?\s*giang\b': 'kien giang',
-        r'\bt\.?\s*ninh\b': 'tay ninh',
-        r'\bl\.?\s*an\b': 'long an',
-        r'\bb\.?\s*tre\b': 'ben tre',
-        r'\bv\.?\s*long\b': 'vinh long',
-        r'\bs\.?\s*trang\b': 'soc trang',
-        r'\bc\.?\s*tho\b': 'can tho',
-        r'\ba\.?\s*giang\b': 'an giang'
-    }
-    
-    # HCMC district abbreviations - only apply in HCM context
-    if is_hcmc:
-        district_abbrev = {
-            # Main districts
-            r'\bbt\b': 'binh thanh',      # Bình Thạnh
-            r'\bpn\b': 'phu nhuan',       # Phú Nhuận
-            r'\btb\b': 'tan binh',        # Tân Bình
-            r'\btd\b': 'thu duc',         # Thủ Đức
-            r'\bgv\b': 'go vap',          # Gò Vấp
-            # Remove tp -> tan phu mapping for HCM context
-            r'\bqb\b': 'quan binh',       # Quận Bình
-            r'\bbc\b': 'binh chanh',      # Bình Chánh
-            r'\bhm\b': 'hoc mon',         # Hóc Môn
-            r'\bcg\b': 'can gio',         # Cần Giờ
-            r'\bnbe\b': 'nha be',         # Nhà Bè
-            
-            # Additional variations
-            r'\bbinh\s*thanh\b': 'binh thanh',  # Normalize Bình Thạnh
-            r'\bphu\s*nhuan\b': 'phu nhuan',    # Normalize Phú Nhuận
-            r'\btan\s*binh\b': 'tan binh',      # Normalize Tân Bình
-            r'\bthu\s*duc\b': 'thu duc',        # Normalize Thủ Đức
-            r'\bgo\s*vap\b': 'go vap',          # Normalize Gò Vấp
-            # Remove tan phu normalization for HCM context
-            r'\bbinh\s*chanh\b': 'binh chanh',  # Normalize Bình Chánh
-            r'\bhoc\s*mon\b': 'hoc mon',        # Normalize Hóc Môn
-            r'\bcan\s*gio\b': 'can gio',        # Normalize Cần Giờ
-            r'\bnha\s*be\b': 'nha be',          # Normalize Nhà Bè
-            
-            # Numeric districts
-            r'\bq\.?\s*(\d+)\b': r'quan \1',    # Q.1, Q.2, etc.
-            r'\bq\s+(\d+)\b': r'quan \1',       # Q 1, Q 2, etc.
-            r'\bquan\.?\s*(\d+)\b': r'quan \1', # Quan 1, Quan 2, etc.
-            r'\bq(\d+)\b': r'quan \1',          # Q1, Q2, etc.
-            
-            # Special cases
-            r'\bq\s*nhat\b': 'quan 1',          # Quận Nhất -> Quận 1
-            r'\bquan\s*nhat\b': 'quan 1',
-            r'\bq\s*muoi\s*mot\b': 'quan 11',   # Quận Mười Một -> Quận 11
-            r'\bquan\s*muoi\s*mot\b': 'quan 11' # Quận Mười Một -> Quận 11
+        # 5. Handle special abbreviations before removing dots
+        # Common province abbreviations
+        province_abbrev = {
+            r'\bt\.?\s*giang\b': 'tien giang',
+            r'\bb\.?\s*duong\b': 'binh duong',
+            r'\bb\.?\s*dinh\b': 'binh dinh',
+            r'\bb\.?\s*thuan\b': 'binh thuan',
+            r'\bb\.?\s*phuoc\b': 'binh phuoc',
+            r'\bd\.?\s*nai\b': 'dong nai',
+            r'\bh\.?\s*giang\b': 'hau giang',
+            r'\bk\.?\s*giang\b': 'kien giang',
+            r'\bt\.?\s*ninh\b': 'tay ninh',
+            r'\bl\.?\s*an\b': 'long an',
+            r'\bb\.?\s*tre\b': 'ben tre',
+            r'\bv\.?\s*long\b': 'vinh long',
+            r'\bs\.?\s*trang\b': 'soc trang',
+            r'\bc\.?\s*tho\b': 'can tho',
+            r'\ba\.?\s*giang\b': 'an giang'
         }
         
-        # Apply district abbreviations only in HCM context
-        for pattern, replacement in district_abbrev.items():
-            text = re.sub(pattern, replacement, text)
+        # HCMC district abbreviations - only apply in HCM context
+        if is_hcmc:
+            district_abbrev = {
+                # Main districts
+                r'\bbt\b': 'binh thanh',      # Bình Thạnh
+                r'\bpn\b': 'phu nhuan',       # Phú Nhuận
+                r'\btb\b': 'tan binh',        # Tân Bình
+                r'\btd\b': 'thu duc',         # Thủ Đức
+                r'\bgv\b': 'go vap',          # Gò Vấp
+                # Remove tp -> tan phu mapping for HCM context
+                r'\bqb\b': 'quan binh',       # Quận Bình
+                r'\bbc\b': 'binh chanh',      # Bình Chánh
+                r'\bhm\b': 'hoc mon',         # Hóc Môn
+                r'\bcg\b': 'can gio',         # Cần Giờ
+                r'\bnbe\b': 'nha be',         # Nhà Bè
+                
+                # Additional variations
+                r'\bbinh\s*thanh\b': 'binh thanh',  # Normalize Bình Thạnh
+                r'\bphu\s*nhuan\b': 'phu nhuan',    # Normalize Phú Nhuận
+                r'\btan\s*binh\b': 'tan binh',      # Normalize Tân Bình
+                r'\bthu\s*duc\b': 'thu duc',        # Normalize Thủ Đức
+                r'\bgo\s*vap\b': 'go vap',          # Normalize Gò Vấp
+                # Remove tan phu normalization for HCM context
+                r'\bbinh\s*chanh\b': 'binh chanh',  # Normalize Bình Chánh
+                r'\bhoc\s*mon\b': 'hoc mon',        # Normalize Hóc Môn
+                r'\bcan\s*gio\b': 'can gio',        # Normalize Cần Giờ
+                r'\bnha\s*be\b': 'nha be',          # Normalize Nhà Bè
+                
+                # Numeric districts
+                r'\bq\.?\s*(\d+)\b': r'quan \1',    # Q.1, Q.2, etc.
+                r'\bq\s+(\d+)\b': r'quan \1',       # Q 1, Q 2, etc.
+                r'\bquan\.?\s*(\d+)\b': r'quan \1', # Quan 1, Quan 2, etc.
+                r'\bq(\d+)\b': r'quan \1',          # Q1, Q2, etc.
+                
+                # Special cases
+                r'\bq\s*nhat\b': 'quan 1',          # Quận Nhất -> Quận 1
+                r'\bquan\s*nhat\b': 'quan 1',
+                r'\bq\s*muoi\s*mot\b': 'quan 11',   # Quận Mười Một -> Quận 11
+                r'\bquan\s*muoi\s*mot\b': 'quan 11' # Quận Mười Một -> Quận 11
+            }
+            
+            # Apply district abbreviations only in HCM context
+            for pattern, replacement in district_abbrev.items():
+                normalized_part = re.sub(pattern, replacement, normalized_part)
     
-    # Apply province abbreviations
-    for pattern, replacement in province_abbrev.items():
-        text = re.sub(pattern, replacement, text)
+        # Apply province abbreviations
+        for pattern, replacement in province_abbrev.items():
+            normalized_part = re.sub(pattern, replacement, normalized_part)
     
-    # Handle ward/district abbreviations with numbers
-    text = re.sub(r'\bp\.?\s*(\d+)\b', r'phuong \1', text)
-    text = re.sub(r'\bq\.?\s*(\d+)\b', r'quan \1', text)
+        # Handle ward/district abbreviations with numbers
+        normalized_part = re.sub(r'\bp\.?\s*(\d+)\b', r'phuong \1', normalized_part)
+        normalized_part = re.sub(r'\bq\.?\s*(\d+)\b', r'quan \1', normalized_part)
     
-    # Handle ward/district without numbers - only if followed by a letter
-    text = re.sub(r'\bp\.\s*([a-zđ])', r'phuong \1', text)
-    text = re.sub(r'\bq\.\s*([a-zđ])', r'quan \1', text)
+        # Handle ward/district without numbers - only if followed by a letter
+        normalized_part = re.sub(r'\bp\.\s*([a-zđ])', r'phuong \1', normalized_part)
+        normalized_part = re.sub(r'\bq\.\s*([a-zđ])', r'quan \1', normalized_part)
     
-    # Handle other common abbreviations
-    text = re.sub(r'\bđ\.\s*', 'duong ', text)
-    text = re.sub(r'\bt\.\s*', 'tinh ', text)
-    # Only expand tp. if not in HCM context
-    if not is_hcmc:
-        text = re.sub(r'\btp\.\s*', 'tp ', text)
-    text = re.sub(r'\btx\.\s*', 'thi xa ', text)
-    text = re.sub(r'\btt\.\s*', 'thi tran ', text)
-    text = re.sub(r'\bh\.\s*', 'huyen ', text)
+        # Handle other common abbreviations
+        normalized_part = re.sub(r'\bđ\.\s*', 'duong ', normalized_part)
+        normalized_part = re.sub(r'\bt\.\s*', 'tinh ', normalized_part)
+        # Only expand tp. if not in HCM context
+        if not is_hcmc:
+            normalized_part = re.sub(r'\btp\.\s*', 'tp ', normalized_part)
+        normalized_part = re.sub(r'\btx\.\s*', 'thi xa ', normalized_part)
+        normalized_part = re.sub(r'\btt\.\s*', 'thi tran ', normalized_part)
+        normalized_part = re.sub(r'\bh\.\s*', 'huyen ', normalized_part)
     
-    # Special cases - prevent over-expansion
-    text = re.sub(r'\bkp\b', 'khu pho', text)  # Expand kp only as whole word
+        # Special cases - prevent over-expansion
+        normalized_part = re.sub(r'\bkp\b', 'khu pho', normalized_part)  # Expand kp only as whole word
     
-    # Now remove remaining dots
-    text = re.sub(r'\.', ' ', text)
+        # Now remove remaining dots
+        normalized_part = re.sub(r'\.', ' ', normalized_part)
 
-    # 6. Remove diacritics (already done in detect_hcm_context)
+        # 6. Remove diacritics for normalized version
+        normalized_part = remove_diacritics(normalized_part)
 
-    # 7. Normalize multiple spaces
-    text = re.sub(r'\s+', ' ', text).strip()
+        # 7. Normalize multiple spaces
+        normalized_part = re.sub(r'\s+', ' ', normalized_part).strip()
 
-    # 8. Split into tokens
-    tokens = text.split()
+        # 8. Process the text word by word to maintain original-normalized pairs
+        token_pairs = []
+        
+        # First, preprocess administrative unit abbreviations in original text
+        admin_abbrev_map = {
+            'Tnh': 'Tỉnh',
+            'TNH': 'Tỉnh',
+            'TNH.': 'Tỉnh',
+            'H.': 'Huyện',
+            'H': 'Huyện',
+            'Q.': 'Quận',
+            'Q': 'Quận',
+            'P.': 'Phường',
+            'P': 'Phường',
+            'X.': 'Xã',
+            'X': 'Xã',
+            'TT.': 'Thị trấn',
+            'TT': 'Thị trấn',
+            'TX.': 'Thị xã',
+            'TX': 'Thị xã',
+            'TP.': 'Thành phố',
+            'TP': 'Thành phố',
+            'F.': 'Phường',
+            'F': 'Phường'
+        }
+        
+        # Replace abbreviations in original text
+        for abbrev, full in admin_abbrev_map.items():
+            if '.' in abbrev:
+                original_part = re.sub(r'\b' + re.escape(abbrev) + r'\b', full, original_part)
+            else:
+                pattern = r'\b' + re.escape(abbrev) + r'(?=[A-Z0-9])'
+                original_part = re.sub(pattern, full + ' ', original_part)
+                original_part = re.sub(r'\b' + re.escape(abbrev) + r'\b', full, original_part)
+        
+        # Split into words while preserving diacritics
+        original_words = []
+        current_word = []
+        
+        for char in original_part:
+            if char.isspace() or char in ',.!?;:':
+                if current_word:
+                    original_words.append(''.join(current_word))
+                    current_word = []
+            else:
+                if current_word and (
+                    (char.isdigit() and not current_word[-1].isdigit()) or
+                    (not char.isdigit() and current_word[-1].isdigit())
+                ):
+                    original_words.append(''.join(current_word))
+                    current_word = []
+                current_word.append(char)
+        if current_word:
+            original_words.append(''.join(current_word))
+        
+        # Process each original word
+        for orig_word in original_words:
+            clean_orig = re.sub(r'[,.!?;:]', '', orig_word)
+            if not clean_orig:
+                continue
+                
+            norm_word = remove_diacritics(clean_orig.lower())
+            token_pairs.append((norm_word, clean_orig))
+        
+        # Add tokens to our lists
+        normalized_tokens = [pair[0] for pair in token_pairs]
+        original_tokens = [pair[1] for pair in token_pairs]
+        
+        # Add to our main lists
+        all_normalized_tokens.extend(normalized_tokens)
+        all_original_tokens.extend(original_tokens)
+        
+        # Add group information
+        comma_groups.extend([current_group] * len(normalized_tokens))
+        
+        current_group += 1
 
     # 9. Expand any remaining abbreviations token by token
     expanded_tokens = []
+    expanded_original_tokens = []
+    expanded_groups = []
     i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        # Skip expansion for certain tokens
+    while i < len(all_normalized_tokens):
+        token = all_normalized_tokens[i]
+        original_token = all_original_tokens[i]
+        group = comma_groups[i]
+        
         if token in ['tp', 'hcm', 'kp']:
             expanded_tokens.append(token)
+            expanded_original_tokens.append(original_token)
+            expanded_groups.append(group)
         else:
-            # Special handling for 'quan' without number
-            if token == 'q' and (i + 1 >= len(tokens) or not tokens[i + 1].isdigit()):
+            if token == 'q' and (i + 1 >= len(all_normalized_tokens) or not all_normalized_tokens[i + 1].isdigit()):
                 expanded_tokens.append('quan')
+                expanded_original_tokens.append('Quận')
+                expanded_groups.append(group)
             else:
                 expanded = expand_abbreviations(token)
                 expanded_tokens.extend(expanded.split())
+                expanded_original_tokens.append(original_token)
+                expanded_groups.extend([group] * len(expanded.split()))
         i += 1
 
     # 10. Standardize place names using official dictionaries
-    tokens = standardize_place_names(expanded_tokens)
+    normalized_tokens = standardize_place_names(expanded_tokens)
     
     # 11. Final ward abbreviation expansion
     final_tokens = []
+    final_original_tokens = []
+    final_groups = []
     i = 0
-    while i < len(tokens):
-        if tokens[i] == 'p' and i + 1 < len(tokens) and not tokens[i + 1].isdigit():
+    while i < len(normalized_tokens):
+        if normalized_tokens[i] == 'p' and i + 1 < len(normalized_tokens) and not normalized_tokens[i + 1].isdigit():
             final_tokens.append('phuong')
+            final_original_tokens.append('Phường')
+            final_groups.append(expanded_groups[i])
             i += 1
         else:
-            final_tokens.append(tokens[i])
+            final_tokens.append(normalized_tokens[i])
+            final_original_tokens.append(expanded_original_tokens[i])
+            final_groups.append(expanded_groups[i])
             i += 1
     
-    return final_tokens, is_hcmc
+    return final_tokens, final_original_tokens, is_hcmc, final_groups
 
 
 ##############################################################
@@ -1099,34 +1251,44 @@ def is_ambiguous_name(name, district_trie, ward_trie):
         logger.error(f"Error in is_ambiguous_name: {str(e)}")
         return False
 
-def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=None, fuzzy_score=None, scoring_weights=None, component_type=None):
+def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=None, fuzzy_score=None, scoring_weights=None, component_type=None, original_tokens=None, comma_groups=None):
     """
     Enhanced version of get_match_confidence that returns detailed information about the score calculation.
     Now uses a 2.0 scale and incorporates fuzzy score with adjusted weights.
     
     Args:
         name: The normalized name to check
-        tokens: All tokens from the address
+        tokens: All normalized tokens from the address
         district_trie: Trie containing district data
         ward_trie: Trie containing ward data
         fuzzy_score: Optional fuzzy match score (0-100)
         scoring_weights: Optional dictionary of scoring weights
         component_type: Type of component being searched for ('ward' or 'district')
+        original_tokens: Original tokens with diacritics
+        comma_groups: List indicating which tokens belong to which comma-separated group
     """
     try:
         # Set default weights if not provided
         if scoring_weights is None:
             scoring_weights = {
-                'fuzzy_score': 0.3,        # Reduced from 0.4 to give less weight to fuzzy matches
-                'exact_match': 0.6,        # Increased from 0.5 to prioritize exact matches
+                'fuzzy_score': 0.15,
+                'exact_match': 0.35,
                 'position_bonus': {
-                    'beginning': 0.3,      # Reduced from 0.4 to be less strict about position
-                    'middle': 0.4          # Reduced from 0.5 to be less strict about position
+                    'beginning': 0.25,
+                    'middle': 0.3
                 },
-                'length_bonus': 0.4,       # Increased from 0.2 to favor multi-word matches
-                'non_ambiguous_bonus': 0.2, # Reduced from 0.3 to be less strict about ambiguity
-                'comma_bonus': 0.3,        # Increased from 0.2 to better handle comma-separated addresses
-                'indicator_bonus': 0.4     # Increased from 0.3 to better handle indicators
+                'length_bonus': {
+                    '2_parts': 0.25,       # Base bonus for 2-part names
+                    '3_parts': 0.35,       # Increased bonus for 3-part names
+                    '4_parts': 0.45        # Even higher bonus for 4-part names
+                },
+                'non_ambiguous_bonus': 0.1,
+                'comma_bonus': 0.25,
+                'indicator_bonus': 0.25,
+                'full_text_match_bonus': 0.3,  # Bonus for matching the full original text
+                'original_text_match_bonus': 0.2,  # Bonus for matching original text with diacritics
+                'unique_ward_bonus': 0.3,  # New bonus for matches that can only be wards
+                'comma_boundary_penalty': -0.5  # New penalty for matches spanning comma boundaries
             }
             
         score_details = {
@@ -1162,6 +1324,8 @@ def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=No
         
         # 2. Exact Match
         exact_match_found = False
+        match_start = -1
+        match_end = -1
         for i in range(len(tokens) - len(name_parts) + 1):
             if tokens[i:i+len(name_parts)] == name_parts:
                 score_details['total_score'] += scoring_weights['exact_match']
@@ -1172,6 +1336,8 @@ def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=No
                     'reason': 'Exakte Übereinstimmung gefunden'
                 })
                 exact_match_found = True
+                match_start = i
+                match_end = i + len(name_parts)
                 break
         
         if not exact_match_found:
@@ -1211,20 +1377,26 @@ def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=No
                 'reason': 'Keine Position gefunden'
             })
         
-        # 4. Length Bonus
-        if len(name_parts) > 1:
-            score_details['total_score'] += scoring_weights['length_bonus']
-            score_details['components'].append({
-                'type': 'length_bonus',
-                'score': scoring_weights['length_bonus'],
-                'reason': f'Mehrteiliger Name ({len(name_parts)} Teile)'
-            })
+        # 4. Length Bonus - Now with different weights based on number of parts
+        if len(name_parts) >= 4:
+            bonus = scoring_weights['length_bonus']['4_parts']
+            reason = f'Mehrteiliger Name ({len(name_parts)} Teile)'
+        elif len(name_parts) == 3:
+            bonus = scoring_weights['length_bonus']['3_parts']
+            reason = f'Mehrteiliger Name ({len(name_parts)} Teile)'
+        elif len(name_parts) == 2:
+            bonus = scoring_weights['length_bonus']['2_parts']
+            reason = f'Mehrteiliger Name ({len(name_parts)} Teile)'
         else:
-            score_details['components'].append({
-                'type': 'length_bonus',
-                'score': 0.0,
-                'reason': 'Einteiliger Name'
-            })
+            bonus = 0.0
+            reason = 'Einteiliger Name'
+            
+        score_details['total_score'] += bonus
+        score_details['components'].append({
+            'type': 'length_bonus',
+            'score': bonus,
+            'reason': reason
+        })
         
         # 5. Non-ambiguity Bonus
         if not score_details['is_ambiguous']:
@@ -1240,6 +1412,25 @@ def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=No
                 'score': 0.0,
                 'reason': 'Name ist mehrdeutig'
             })
+            
+        # 5.1 Unique Ward Bonus (New)
+        if component_type == 'ward' and district_trie and ward_trie:
+            # Check if the name exists in ward but not in district
+            in_ward = ward_trie.search_exact(name)
+            in_district = district_trie.search_exact(name)
+            if in_ward and not in_district:
+                score_details['total_score'] += scoring_weights['unique_ward_bonus']
+                score_details['components'].append({
+                    'type': 'unique_ward_bonus',
+                    'score': scoring_weights['unique_ward_bonus'],
+                    'reason': 'Name exists only as a ward, not as a district'
+                })
+            else:
+                score_details['components'].append({
+                    'type': 'unique_ward_bonus',
+                    'score': 0.0,
+                    'reason': 'Name exists in both ward and district lists or not found in ward list'
+                })
         
         # 6. Comma Bonus
         comma_bonus_found = False
@@ -1264,7 +1455,7 @@ def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=No
                 'reason': 'Kein Komma vor Match gefunden'
             })
             
-        # 7. Indicator Bonus (New) - Only apply for the specific component type being searched
+        # 7. Indicator Bonus
         indicator_bonus_found = False
         ward_indicators = ['phuong', 'xa', 'thi tran', 'p', 'tt']
         district_indicators = ['quan', 'huyen', 'q', 'h']
@@ -1322,6 +1513,107 @@ def get_detailed_confidence_score(name, tokens, district_trie=None, ward_trie=No
                 'score': 0.0,
                 'reason': 'No ward/district indicator found within 3 positions before match'
             })
+            
+        # 8. Full Text Match Bonus
+        # Check if the name matches the full original text
+        original_text = ' '.join(tokens)
+        if name == remove_diacritics(original_text.lower()):
+            score_details['total_score'] += scoring_weights['full_text_match_bonus']
+            score_details['components'].append({
+                'type': 'full_text_match_bonus',
+                'score': scoring_weights['full_text_match_bonus'],
+                'reason': 'Exakte Übereinstimmung mit dem vollständigen Originaltext'
+            })
+        else:
+            score_details['components'].append({
+                'type': 'full_text_match_bonus',
+                'score': 0.0,
+                'reason': 'Keine exakte Übereinstimmung mit dem vollständigen Originaltext'
+            })
+            
+        # 9. Original Text Match Bonus (New)
+        if original_tokens:
+            # Find the position of the match in the normalized tokens
+            for i in range(len(tokens) - len(name_parts) + 1):
+                if tokens[i:i+len(name_parts)] == name_parts:
+                    # Get the corresponding original tokens
+                    original_part = ' '.join(original_tokens[i:i+len(name_parts)])
+                    
+                    # Get the stored full word from the trie
+                    full_word = None
+                    if component_type == 'ward' and ward_trie:
+                        full_word = ward_trie.get_full_word(name, original_part)
+                    elif component_type == 'district' and district_trie:
+                        full_word = district_trie.get_full_word(name, original_part)
+                    
+                    if full_word:
+                        # Split both into words for word-by-word comparison
+                        original_words = original_part.split()
+                        full_words = full_word.split()
+                        
+                        # Count exact word matches
+                        exact_word_matches = 0
+                        for orig_word, full_word in zip(original_words, full_words):
+                            if orig_word == full_word:
+                                exact_word_matches += 1
+                        
+                        # Calculate bonus based on number of exact word matches
+                        if exact_word_matches > 0:
+                            # Base bonus is proportional to number of exact matches
+                            base_bonus = (exact_word_matches / len(full_words)) * scoring_weights['original_text_match_bonus']
+                            
+                            # Additional bonus for having all words match
+                            if exact_word_matches == len(full_words):
+                                base_bonus *= 1.2  # 20% extra bonus for perfect match
+                            
+                            score_details['total_score'] += base_bonus
+                            score_details['components'].append({
+                                'type': 'original_text_match_bonus',
+                                'score': base_bonus,
+                                'exact_matches': exact_word_matches,
+                                'total_words': len(full_words),
+                                'reason': f'Found {exact_word_matches} exact word matches out of {len(full_words)} words'
+                            })
+                        else:
+                            # If no exact word matches, try fuzzy matching as fallback
+                            ratio = fuzz.ratio(original_part, full_word)
+                            if ratio >= 80:  # Only give bonus for high matches
+                                bonus = (ratio / 100) * scoring_weights['original_text_match_bonus'] * 0.5  # Reduced bonus for fuzzy match
+                                score_details['total_score'] += bonus
+                                score_details['components'].append({
+                                    'type': 'original_text_match_bonus',
+                                    'score': bonus,
+                                    'raw_score': ratio,
+                                    'reason': f'No exact word matches, but fuzzy match with {ratio}% similarity'
+                                })
+                            else:
+                                score_details['components'].append({
+                                    'type': 'original_text_match_bonus',
+                                    'score': 0.0,
+                                    'raw_score': ratio,
+                                    'reason': f'No exact word matches and fuzzy match too low ({ratio}% similarity)'
+                                })
+                    break
+        
+        # 10. Comma Boundary Penalty (New)
+        if comma_groups and match_start >= 0 and match_end >= 0:
+            # Get the groups of the matched tokens
+            match_groups = set(comma_groups[match_start:match_end])
+            # If we have more than one group, it means the match spans across comma boundaries
+            if len(match_groups) > 1:
+                penalty = scoring_weights['comma_boundary_penalty']
+                score_details['total_score'] += penalty
+                score_details['components'].append({
+                    'type': 'comma_boundary_penalty',
+                    'score': penalty,
+                    'reason': f'Match spans across {len(match_groups)} comma-separated groups'
+                })
+            else:
+                score_details['components'].append({
+                    'type': 'comma_boundary_penalty',
+                    'score': 0.0,
+                    'reason': 'Match does not span across comma boundaries'
+                })
         
         # Final score (max 2.0)
         score_details['total_score'] = min(score_details['total_score'], 2.0)
@@ -1507,7 +1799,7 @@ def get_hcm_numeric_district_score(token, tokens, position):
         logger.error(f"Error in get_hcm_numeric_district_score: {str(e)}")
         return 0.0
 
-def find_district(tokens, district_trie, ward_trie=None, scoring_weights=None, is_hcm=False):
+def find_district(tokens, district_trie, ward_trie=None, scoring_weights=None, is_hcm=False, original_tokens=None, comma_groups=None):
     if not tokens:
         logger.debug("No tokens provided for district search")
         return None, 0.0
@@ -1549,7 +1841,9 @@ def find_district(tokens, district_trie, ward_trie=None, scoring_weights=None, i
                     district_trie, 
                     ward_trie,
                     scoring_weights=scoring_weights,
-                    component_type='district'  # Specify we're looking for a district
+                    component_type='district',  # Specify we're looking for a district
+                    original_tokens=original_tokens,  # Add original tokens
+                    comma_groups=comma_groups  # Add comma groups
                 )
                 confidence = score_details['total_score']
                 logger.debug(f"Confidence score for exact match: {confidence:.2f}")
@@ -1599,7 +1893,9 @@ def find_district(tokens, district_trie, ward_trie=None, scoring_weights=None, i
                     ward_trie,
                     fuzzy_score=fuzzy_score,
                     scoring_weights=scoring_weights,
-                    component_type='district'  # Specify we're looking for a district
+                    component_type='district',  # Specify we're looking for a district
+                    original_tokens=original_tokens,  # Add original tokens
+                    comma_groups=comma_groups  # Add comma groups
                 )
                 
                 if score_details['total_score'] > best_score:
@@ -1614,7 +1910,7 @@ def find_district(tokens, district_trie, ward_trie=None, scoring_weights=None, i
     logger.debug("No district match found")
     return None, 0.0
 
-def find_ward(tokens, ward_trie, district_trie=None, scoring_weights=None):
+def find_ward(tokens, ward_trie, district_trie=None, scoring_weights=None, original_tokens=None, comma_groups=None):
     if not tokens:
         logger.debug("No tokens provided for ward search")
         return None, 0.0
@@ -1648,7 +1944,9 @@ def find_ward(tokens, ward_trie, district_trie=None, scoring_weights=None):
                     district_trie, 
                     ward_trie,
                     scoring_weights=scoring_weights,
-                    component_type='ward'  # Specify we're looking for a ward
+                    component_type='ward',  # Specify we're looking for a ward
+                    original_tokens=original_tokens,  # Add original tokens
+                    comma_groups=comma_groups  # Add comma groups
                 )
                 confidence = score_details['total_score']
                 logger.debug(f"Confidence score for exact match: {confidence:.2f}")
@@ -1698,7 +1996,9 @@ def find_ward(tokens, ward_trie, district_trie=None, scoring_weights=None):
                     ward_trie,
                     fuzzy_score=fuzzy_score,
                     scoring_weights=scoring_weights,
-                    component_type='ward'  # Specify we're looking for a ward
+                    component_type='ward',  # Specify we're looking for a ward
+                    original_tokens=original_tokens,  # Add original tokens
+                    comma_groups=comma_groups  # Add comma groups
                 )
                 
                 if score_details['total_score'] > best_score:
@@ -1735,121 +2035,159 @@ def parse_location_components(text, province_trie, district_trie, ward_trie, sco
         validation_thresholds: Optional dictionary of validation thresholds
         disable_file_logging: If True, disable logging to file
     """
-    # Set up logging based on parameter
-    setup_logging(disable_file_logging)
-    
-    # Set default weights if not provided
-    if scoring_weights is None:
-        scoring_weights = {
-            'fuzzy_score': 0.3,        # Reduced from 0.4 to give less weight to fuzzy matches
-            'exact_match': 0.6,        # Increased from 0.5 to prioritize exact matches
-            'position_bonus': {
-                'beginning': 0.3,      # Reduced from 0.4 to be less strict about position
-                'middle': 0.4          # Reduced from 0.5 to be less strict about position
-            },
-            'length_bonus': 0.4,       # Increased from 0.2 to favor multi-word matches
-            'non_ambiguous_bonus': 0.2, # Reduced from 0.3 to be less strict about ambiguity
-            'comma_bonus': 0.3,        # Increased from 0.2 to better handle comma-separated addresses
-            'indicator_bonus': 0.4     # Increased from 0.3 to better handle indicators
-        }
-    
-    # Set default thresholds if not provided
-    if validation_thresholds is None:
-        validation_thresholds = {
-            'ward': {
-                'non_ambiguous': 0.8,      # Increased from 0.7
-                'ambiguous_beginning': 0.9, # Increased from 0.7
-                'ambiguous_middle': 0.8     # Increased from 0.7
-            },
-            'district': {
-                'non_ambiguous': 0.8,      # Increased from 0.7
-                'ambiguous_beginning': 0.9, # Increased from 0.7
-                'ambiguous_middle': 0.8     # Increased from 0.7
-            }
-        }
-    
-    # Normalize input text and detect HCM context
-    normalized_tokens, is_hcm = normalize_text(text)
-    if not normalized_tokens:
-        return {
-            'province': None,
-            'district': None,
-            'ward': None,
-            'is_hcm': False,
-            'normalized_tokens': []
-        }
-    
-    # Initialize results
-    province = None
-    district = None
-    ward = None
-    
-    
-    # Special handling for HCM context
-    if is_hcm:
-        province = 'Hồ Chí Minh'
-    
-    # If no HCM context or no numeric district found, proceed with normal parsing
-    if not province:
-        # 1. Find Province
-        # First try exact match
-        for i in range(len(normalized_tokens)):
-            for j in range(i + 1, min(i + 4, len(normalized_tokens) + 1)):
-                search_text = ' '.join(normalized_tokens[i:j])
-                if province_trie.search_exact(search_text):
-                    province = province_trie.get_full_word(search_text)
-                    break
-            if province:
-                break
+    try:
+        # Set up logging based on parameter
+        setup_logging(disable_file_logging)
         
-        # If no exact match, try fuzzy match
+        # Set default weights if not provided
+        if scoring_weights is None:
+            scoring_weights = {
+                'fuzzy_score': 0.15,
+                'exact_match': 0.35,
+                'position_bonus': {
+                    'beginning': 0.25,
+                    'middle': 0.3
+                },
+                'length_bonus': {
+                    '2_parts': 0.25,       # Base bonus for 2-part names
+                    '3_parts': 0.35,       # Increased bonus for 3-part names
+                    '4_parts': 0.45        # Even higher bonus for 4-part names
+                },
+                'non_ambiguous_bonus': 0.1,
+                'comma_bonus': 0.25,
+                'indicator_bonus': 0.25,
+                'full_text_match_bonus': 0.3,  # Bonus for matching the full original text
+                'original_text_match_bonus': 0.2,  # Bonus for matching original text with diacritics
+                'unique_ward_bonus': 0.3,  # New bonus for matches that can only be wards
+                'comma_boundary_penalty': -0.5  # New penalty for matches spanning comma boundaries
+            }
+        
+        # Set default thresholds if not provided
+        if validation_thresholds is None:
+            validation_thresholds = {
+                'ward': {
+                    'non_ambiguous': 0.8,      # Increased from 0.7
+                    'ambiguous_beginning': 0.9, # Increased from 0.7
+                    'ambiguous_middle': 0.8     # Increased from 0.7
+                },
+                'district': {
+                    'non_ambiguous': 0.8,      # Increased from 0.7
+                    'ambiguous_beginning': 0.9, # Increased from 0.7
+                    'ambiguous_middle': 0.8     # Increased from 0.7
+                }
+            }
+        
+        # Normalize input text and detect HCM context
+        normalized_tokens, original_tokens, is_hcm, comma_groups = normalize_text(text)
+        if not normalized_tokens:
+            return {
+                'province': None,
+                'district': None,
+                'ward': None,
+                'is_hcm': False,
+                'normalized_tokens': [],
+                'original_tokens': [],
+                'comma_groups': []
+            }
+        
+        # Initialize results
+        province = None
+        district = None
+        ward = None
+        
+        # Special handling for HCM context
+        if is_hcm:
+            province = 'Hồ Chí Minh'
+        
+        # If no HCM context or no numeric district found, proceed with normal parsing
         if not province:
+            # 1. Find Province
+            # First try exact match
             for i in range(len(normalized_tokens)):
                 for j in range(i + 1, min(i + 4, len(normalized_tokens) + 1)):
                     search_text = ' '.join(normalized_tokens[i:j])
-                    matches = fuzzy_search_in_trie(province_trie, search_text, max_dist=2)
-                    if matches:
-                        province = province_trie.get_full_word(matches[0][0])
+                    if province_trie.search_exact(search_text):
+                        # Get the corresponding part of original text
+                        original_part = ' '.join(original_tokens[i:j])
+                        province = province_trie.get_full_word(search_text, original_part)
                         break
                 if province:
                     break
-    
-    # 2. Find District using find_district with confidence score
-    district, district_score = find_district(
-        normalized_tokens, 
-        district_trie, 
-        ward_trie, 
-        scoring_weights=scoring_weights,
-        is_hcm=is_hcm
-    )
-    
-    # Validate district match
-    if district and validate_district_match(district, normalized_tokens, district_score, validation_thresholds, province, ward_trie, district_trie):
-        district = district_trie.get_full_word(district)
-    else:
-        district = None
-    
-    # 3. Find Ward using find_ward with confidence score
-    ward, ward_score = find_ward(
-        normalized_tokens, 
-        ward_trie, 
-        district_trie, 
-        scoring_weights=scoring_weights
-    )
-    
-    # Validate ward match
-    if ward and validate_ward_match(ward, normalized_tokens, ward_score, validation_thresholds, district_trie, ward_trie):
-        ward = ward_trie.get_full_word(ward)
-    else:
-        ward = None
-    
-    return {
-        'province': province,
-        'district': district,
-        'ward': ward,
-        'is_hcm': is_hcm,
-        'normalized_tokens': normalized_tokens
-    }
+            
+            # If no exact match, try fuzzy match
+            if not province:
+                for i in range(len(normalized_tokens)):
+                    for j in range(i + 1, min(i + 4, len(normalized_tokens) + 1)):
+                        search_text = ' '.join(normalized_tokens[i:j])
+                        matches = fuzzy_search_in_trie(province_trie, search_text, max_dist=2)
+                        if matches:
+                            # Get the corresponding part of original text
+                            original_part = ' '.join(original_tokens[i:j])
+                            province = province_trie.get_full_word(matches[0][0], original_part)
+                            break
+                    if province:
+                        break
+        
+        # 2. Find District using find_district with confidence score
+        district, district_score = find_district(
+            normalized_tokens, 
+            district_trie, 
+            ward_trie, 
+            scoring_weights=scoring_weights,
+            is_hcm=is_hcm,
+            original_tokens=original_tokens,  # Add original tokens
+            comma_groups=comma_groups  # Add comma groups
+        )
+        
+        # Validate district match
+        if district and validate_district_match(district, normalized_tokens, district_score, validation_thresholds, province, ward_trie, district_trie):
+            # Find the position of the district in normalized tokens
+            district_parts = district.split()
+            for i in range(len(normalized_tokens) - len(district_parts) + 1):
+                if normalized_tokens[i:i+len(district_parts)] == district_parts:
+                    # Get the corresponding part of original text
+                    original_part = ' '.join(original_tokens[i:i+len(district_parts)])
+                    district = district_trie.get_full_word(district, original_part)
+                    break
+        else:
+            district = None
+        
+        # 3. Find Ward using find_ward with confidence score
+        ward, ward_score = find_ward(
+            normalized_tokens, 
+            ward_trie, 
+            district_trie, 
+            scoring_weights=scoring_weights,
+            original_tokens=original_tokens,  # Add original tokens
+            comma_groups=comma_groups  # Add comma groups
+        )
+        
+        # Validate ward match
+        if ward and validate_ward_match(ward, normalized_tokens, ward_score, validation_thresholds, district_trie, ward_trie):
+            # Find the position of the ward in normalized tokens
+            ward_parts = ward.split()
+            for i in range(len(normalized_tokens) - len(ward_parts) + 1):
+                if normalized_tokens[i:i+len(ward_parts)] == ward_parts:
+                    # Get the corresponding part of original text
+                    original_part = ' '.join(original_tokens[i:i+len(ward_parts)])
+                    ward = ward_trie.get_full_word(ward, original_part)
+                    break
+        else:
+            ward = None
+        
+        return {
+            'province': province,
+            'district': district,
+            'ward': ward,
+            'is_hcm': is_hcm,
+            'normalized_tokens': normalized_tokens,
+            'original_tokens': original_tokens,
+            'comma_groups': comma_groups
+        }
+    except Exception as e:
+        logger.error(f"Error in parse_location_components: {str(e)}")
+        logger.error(traceback.format_exc())  # Add stack trace to log file
+        return None
 
 def run_demo_test_file():
     """
@@ -1900,9 +2238,16 @@ def run_demo_test_file():
         failures = defaultdict(list)
 
         print(f"\nRunning {total_tests} test cases...")
+
+        indeeex = 0;
         
         for i, test_case in enumerate(test_cases, 1):
             try:
+
+                if test_case['text'] != "Thái Ha, HBa Vì, T.pHNội":
+                    continue
+
+
                 print(f"\nProcessing test case {i} of {total_tests}")
                 address = test_case['text']
                 expected = test_case['result']
@@ -1919,7 +2264,7 @@ def run_demo_test_file():
                     province_trie=province_trie,
                     district_trie=district_trie,
                     ward_trie=ward_trie,
-                    disable_file_logging=False,  # Enable logging for this test case
+                    disable_file_logging=True,  # Enable logging for this test case
                     validation_thresholds = {
                         "ward": {
                             "non_ambiguous": 0.75,
@@ -1939,10 +2284,17 @@ def run_demo_test_file():
                             "beginning": 0.25,
                             "middle": 0.3
                         },
-                        "length_bonus": 0.25,
+                        "length_bonus": {
+                            "2_parts": 0.25,       # Base bonus for 2-part names
+                            "3_parts": 0.35,       # Increased bonus for 3-part names
+                            "4_parts": 0.45        # Even higher bonus for 4-part names
+                        },
                         "non_ambiguous_bonus": 0.1,
                         "comma_bonus": 0.25,
-                        "indicator_bonus": 0.25
+                        "indicator_bonus": 0.25,
+                        "full_text_match_bonus": 0.3,  # Bonus for matching the full original text
+                        "original_text_match_bonus": 0.2,  # New bonus for matching original text with diacritics
+                        "unique_ward_bonus": 0.2  # New bonus for matches that can only be wards
                     }
                 )
                 print("Address parsing completed")
@@ -1985,6 +2337,12 @@ def run_demo_test_file():
                 failed += 1
                 failures[address] = [f"Error: {str(e)}"]
                 continue
+        
+        if failed > 0:
+            print("\nFailed test cases:")
+            for address, reasons in failures.items():
+                print(f"\nAddress: {address}")
+                print(f"Reasons: {'; '.join(reasons)}")
 
         # Print summary
         print("\n=== Test Results Summary ===")
@@ -1992,12 +2350,8 @@ def run_demo_test_file():
         print(f"Successful: {successful}")
         print(f"Failed: {failed}")
         print(f"Success rate: {(successful/total_tests)*100:.2f}%")
-        
-        if failed > 0:
-            print("\nFailed test cases:")
-            for address, reasons in failures.items():
-                print(f"\nAddress: {address}")
-                print(f"Reasons: {'; '.join(reasons)}")
+
+        print(indeeex)
                 
     except Exception as e:
         print(f"Critical error in run_demo_test_file: {str(e)}")
