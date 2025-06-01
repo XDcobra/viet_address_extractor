@@ -2198,7 +2198,7 @@ def parse_location_components(text, province_trie, district_trie, ward_trie, sco
                     district = district_candidates[0][0]
                 if ward_candidates:
                     ward = ward_candidates[0][0]
-        
+
         return {
             'province': province,
             'district': district,
@@ -2316,7 +2316,8 @@ def run_demo_test_file():
                         "indicator_bonus": 0.25,
                         "full_text_match_bonus": 0.3,  # Bonus for matching the full original text
                         "original_text_match_bonus": 0.2,  # New bonus for matching original text with diacritics
-                        "unique_ward_bonus": 0.2  # New bonus for matches that can only be wards
+                        "unique_ward_bonus": 0.2,  # New bonus for matches that can only be wards,
+                        "comma_boundary_penalty": -0.5
                     }
                 )
                 print("Address parsing completed")
