@@ -1,9 +1,0 @@
-README.md
-setup.py
-vietnamese_address_classification/__init__.py
-vietnamese_address_classification/classifier.py
-vietnamese_address_classification.egg-info/PKG-INFO
-vietnamese_address_classification.egg-info/SOURCES.txt
-vietnamese_address_classification.egg-info/dependency_links.txt
-vietnamese_address_classification.egg-info/requires.txt
-vietnamese_address_classification.egg-info/top_level.txt
